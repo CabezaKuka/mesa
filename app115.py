@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import socket
 import ssl
 import struct
@@ -965,10 +966,12 @@ DEMUCS_LOCK = threading.Lock()
 # salida de error ("  45%|████   | 105.3/234.0 [00:30<00:37, ...]"); se lee
 # en vivo en vez de esperar a que termine. Si el modelo es un "bag" de N
 # modelos, Demucs lo avisa y dibuja N barras seguidas: se encadenan.
-# Reparto del 100 %: separación 0–92 %, armado de los mp3 livianos 92–100 %.
+# Reparto del 100 %: separación 0–90 %, armado de los mp3 livianos 90–96 %, y (v115)
+# detección de acordes y pulso 96–100 %, así el tema ya abre con los acordes listos.
 _RE_PCT_DEMUCS = re.compile(r"(\d{1,3})%\|")
 _RE_BAG_DEMUCS = re.compile(r"bag of (\d+) models")
-_PCT_SEPARACION = 92.0
+_PCT_SEPARACION = 90.0
+_PCT_MP3 = 96.0
 
 
 def _seguir_demucs(job: dict, proc) -> str:
@@ -1015,7 +1018,7 @@ def _seguir_demucs(job: dict, proc) -> str:
             job["progreso"] = round(frac * _PCT_SEPARACION, 1)
             if frac >= 0.03:
                 ritmo = (ahora - t_barras) / frac          # segundos por "separación entera"
-                restante = ritmo * (1.0 - frac) + 0.08 * ritmo   # + los mp3
+                restante = ritmo * (1.0 - frac) + 0.12 * ritmo   # + los mp3 y los acordes
                 job["estimado"] = round(ahora - job["started"] + restante)
         if len(texto_log) > 200:
             del texto_log[:-200]
@@ -1053,9 +1056,18 @@ def run_demucs(job_id: str, input_path: Path):
                 for i, stem in enumerate(STEM_ORDER):
                     asegurar_mp3_stem(carpeta, stem)
                     hechos = i + 1
-                    job["progreso"] = round(_PCT_SEPARACION + (100 - _PCT_SEPARACION) * hechos / len(STEM_ORDER), 1)
+                    job["progreso"] = round(_PCT_SEPARACION + (_PCT_MP3 - _PCT_SEPARACION) * hechos / len(STEM_ORDER), 1)
                     por_stem = (time.time() - t_mp3) / hechos
                     job["estimado"] = round(time.time() - job["started"] + por_stem * (len(STEM_ORDER) - hechos))
+                # v115: acordes y pulso ahora, no al abrir el tema. Si falla, no es grave:
+                # se reintenta solo la primera vez que se abra.
+                job["etapa"] = "acordes"
+                job["progreso"] = _PCT_MP3
+                if not (carpeta / "acordes.txt").exists():
+                    try:
+                        _generar_grilla(carpeta)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[mesa] no pude analizar los acordes de {carpeta.name} ({exc}); se intenta al abrirlo")
                 job["progreso"] = 100.0
                 JOBS[job_id]["status"] = "listo"
     except FileNotFoundError:
@@ -1089,6 +1101,13 @@ TRIADAS = {"": [0, 4, 7], "m": [0, 3, 7], "7": [0, 4, 7, 10]}
 # como plantilla del detector daría falsos positivos). Solo edición/importación.
 SUFIJOS_EXTRA_EDICION = {"maj7": [0, 4, 7, 11], "sus4": [0, 5, 7]}
 SUFIJOS_VALIDOS = {**TRIADAS, **SUFIJOS_EXTRA_EDICION}
+
+
+def _duracion_wav(path):
+    """Duración en segundos leyendo solo el encabezado (v115: antes se cargaba el wav entero,
+    ~40 MB en un tema de 4 minutos, solo para esto)."""
+    with wave.open(str(path), "rb") as wf:
+        return wf.getnframes() / float(wf.getframerate())
 
 
 def _cargar_wav_mono(path):
@@ -1128,14 +1147,65 @@ def _matriz_basis(frame_len, sr, midi_min=40, midi_max=91, cents=0.0):
     return base, pitch_class
 
 
-def _mags_de_audio(data, sr, frame_len=8192, hop=4096, cents=0.0):
-    """Magnitud por marco de las 52 notas MIDI 40-91 (antes de sumarlas por clase de altura)."""
+_MARCOS_POR_TANDA = 256
+
+
+def _proyectar_notas(data, sr, frame_len=8192, hop=4096, midi_min=40, midi_max=91, cents=0.0):
+    """Magnitud por marco de cada nota MIDI midi_min..midi_max: proyección de cada marco (con
+    ventana de Hann) sobre la frecuencia exacta de la nota.
+
+    v115: coseno y seno por separado, en float32 y de a tandas. Antes se multiplicaba por la
+    base compleja y numpy pasaba TODOS los marcos a complex128 antes del producto: mismo
+    resultado (diferencia relativa ~1e-7), pero en un tema de 4 minutos tardaba 1,75 s y
+    pedía 432 MB por stem; así son 0,06 s y unos pocos MB."""
     if len(data) < frame_len:
         data = np.pad(data, (0, frame_len - len(data)))
-    marcos = sliding_window_view(data, frame_len)[::hop].copy()
-    marcos *= np.hanning(frame_len)
-    base, pitch_class = _matriz_basis(frame_len, sr, cents=cents)
-    return np.abs(marcos @ base.T), pitch_class  # (n_frames, K)
+    vista = sliding_window_view(np.asarray(data, dtype=np.float32), frame_len)[::hop]
+    base, pitch_class = _matriz_basis(frame_len, sr, midi_min, midi_max, cents)
+    cos_ = np.ascontiguousarray(base.real.T, dtype=np.float32)
+    sin_ = np.ascontiguousarray(base.imag.T, dtype=np.float32)
+    hann = np.hanning(frame_len).astype(np.float32)
+    out = np.empty((vista.shape[0], len(pitch_class)), dtype=np.float64)
+    for i in range(0, vista.shape[0], _MARCOS_POR_TANDA):
+        marcos = vista[i:i + _MARCOS_POR_TANDA] * hann
+        out[i:i + _MARCOS_POR_TANDA] = np.hypot(marcos @ cos_, marcos @ sin_)
+    return out, pitch_class
+
+
+def _filtros_semitono(frame_len, sr, midi_min, midi_max, cents):
+    """Matriz (bins de la FFT x notas) para la variante "bandas_semitono": cada nota junta
+    TODA la energía que cae a +-50 cents de ella (y se desvanece hasta +-100), en vez de
+    medir una sola frecuencia exacta. En las notas graves, donde un semitono es menos de
+    un bin, se toma al menos el bin más cercano y sus vecinos."""
+    hz = np.arange(frame_len // 2 + 1) * sr / frame_len
+    midis = np.arange(midi_min, midi_max + 1)
+    centros = 440.0 * 2.0 ** ((midis - 69) / 12.0 + cents / 1200.0)
+    with np.errstate(divide="ignore"):
+        semitonos = 12.0 * np.log2(np.maximum(hz, 1e-9)[:, None] / centros[None, :])
+    peso = np.clip(1.0 - np.maximum(0.0, np.abs(semitonos) - 0.5) / 0.5, 0.0, 1.0)
+    cerca = np.abs(hz[:, None] - centros[None, :]) <= 1.0 * sr / frame_len
+    peso = np.maximum(peso, cerca.astype(float))
+    return peso.astype(np.float32), midis % 12
+
+
+def _bandas_notas(data, sr, frame_len=8192, hop=4096, midi_min=40, midi_max=91, cents=0.0):
+    """Igual que _proyectar_notas pero sumando bandas de un semitono de la FFT."""
+    if len(data) < frame_len:
+        data = np.pad(data, (0, frame_len - len(data)))
+    vista = sliding_window_view(np.asarray(data, dtype=np.float32), frame_len)[::hop]
+    filtros, pitch_class = _filtros_semitono(frame_len, sr, midi_min, midi_max, cents)
+    hann = np.hanning(frame_len).astype(np.float32)
+    out = np.empty((vista.shape[0], len(pitch_class)), dtype=np.float64)
+    for i in range(0, vista.shape[0], _MARCOS_POR_TANDA):
+        espectro = np.abs(np.fft.rfft(vista[i:i + _MARCOS_POR_TANDA] * hann, axis=1)).astype(np.float32)
+        out[i:i + _MARCOS_POR_TANDA] = espectro @ filtros
+    return out, pitch_class
+
+
+def _mags_de_audio(data, sr, frame_len=8192, hop=4096, cents=0.0, bandas=False):
+    """Magnitud por marco de las 52 notas MIDI 40-91 (antes de sumarlas por clase de altura)."""
+    funcion = _bandas_notas if bandas else _proyectar_notas
+    return funcion(data, sr, frame_len, hop, cents=cents)  # (n_frames, K)
 
 
 def _mags_a_chroma(mags, pitch_class):
@@ -1271,13 +1341,8 @@ def _chroma_del_bajo(path, frame_len, hop, n_frames, cents=0.0):
     Devuelve una matriz normalizada por marco, con los marcos donde el bajo
     prácticamente no suena puestos en cero (para no amplificar ruido)."""
     data, sr = _cargar_wav_mono(path)
-    if len(data) < frame_len:
-        data = np.pad(data, (0, frame_len - len(data)))
-    marcos = sliding_window_view(data, frame_len)[::hop].copy()
-    marcos *= np.hanning(frame_len)
-    base, pitch_class = _matriz_basis(frame_len, sr, midi_min=40, midi_max=67, cents=cents)
-    mags = np.abs(marcos @ base.T)
-    chroma = np.zeros((marcos.shape[0], 12))
+    mags, pitch_class = _proyectar_notas(data, sr, frame_len, hop, midi_min=40, midi_max=67, cents=cents)
+    chroma = np.zeros((mags.shape[0], 12))
     for pc in range(12):
         chroma[:, pc] = mags[:, pitch_class == pc].sum(axis=1)
 
@@ -1296,21 +1361,31 @@ def _chroma_del_bajo(path, frame_len, hop, n_frames, cents=0.0):
     return np.vstack([chroma, np.zeros((faltan, 12))])
 
 
-def _viterbi(sim, penalizacion):
+def _viterbi(sim, penalizacion, costos=None):
     """Camino de acordes de máximo puntaje total con una penalización fija por cada
     cambio. Reemplaza al argmax marco a marco + moda de 5 marcos: en vez de decidir
     cada marco por separado, decide la secuencia entera, así un acorde que suena
-    durante varios compases no se rompe por unos marcos dudosos."""
+    durante varios compases no se rompe por unos marcos dudosos.
+
+    v115: con `costos` (matriz K x K, diagonal en 0) cada cambio cuesta según el par de
+    acordes en vez de una penalización fija (variante "transiciones")."""
     T, K = sim.shape
     ptr = np.zeros((T, K), dtype=np.int32)
     ar = np.arange(K)
     score = sim[0].copy()
-    for t in range(1, T):
-        j = int(score.argmax())
-        salto = score[j] - penalizacion
-        quedarse = score >= salto
-        ptr[t] = np.where(quedarse, ar, j)
-        score = np.where(quedarse, score, salto) + sim[t]
+    if costos is None:
+        for t in range(1, T):
+            j = int(score.argmax())
+            salto = score[j] - penalizacion
+            quedarse = score >= salto
+            ptr[t] = np.where(quedarse, ar, j)
+            score = np.where(quedarse, score, salto) + sim[t]
+    else:
+        for t in range(1, T):
+            candidatos = score[:, None] - costos      # [desde, hacia]
+            desde = candidatos.argmax(axis=0)
+            ptr[t] = desde
+            score = candidatos[desde, ar] + sim[t]
     camino = np.empty(T, dtype=np.int32)
     k = int(score.argmax())
     for t in range(T - 1, -1, -1):
@@ -1319,8 +1394,204 @@ def _viterbi(sim, penalizacion):
     return camino
 
 
-def _clasificar_frames(chromas, plantillas, chroma_bajo=None, peso_bajo=PESO_BAJO, penalizacion_cambio=0.0,
-                       penalizacion_septima=0.0):
+# --------------------------------------- v115: variantes del detector por plantillas ----
+# Ideas para mejorar la precisión, TODAS APAGADAS por defecto: con ninguna prendida el
+# detector da exactamente lo mismo que app114. No se pueden elegir a ciegas (lo que mejora
+# un tema empeora otro), así que se miden contra los MIDI importados con "Medir mejoras"
+# en Ajustes generales, y ahí mismo se prenden las que ganan (prefs "detector_variantes").
+VARIANTES_DETECTOR = {
+    "por_tiempo": "Cambios de acorde solo en los tiempos del pulso",
+    "tonalidad": "Preferir los acordes de la tonalidad del tema",
+    "bajo_inversiones": "Contar el bajo en la 3ª o la 5ª (inversiones)",
+    "silencio_percentil": "Umbral de silencio que ignora los picos sueltos",
+    "bandas_semitono": "Medir cada nota en una banda de un semitono",
+    "transiciones": "Transiciones entre acordes aprendidas de tus MIDI",
+}
+# tonalidad: bonus a los acordes diatónicos (escala de la similitud coseno, ~0,5-0,95)
+PESO_TONALIDAD = 0.06
+# bajo_inversiones: bonus si el bajo toca la 3ª o la 5ª (la raíz sigue pesando PESO_BAJO)
+PESO_BAJO_INVERSION = 0.15
+# silencio_percentil: el umbral es UMBRAL_SILENCIO de este percentil de la energía, en vez
+# del máximo (un golpe aislado muy fuerte subía el umbral y una intro tranquila salía "—")
+PERCENTIL_SILENCIO = 98
+# transiciones: cuánto se aparta el costo de un cambio de la penalización fija, por cada
+# unidad de log-probabilidad (con transiciones equiprobables queda la penalización fija)
+PESO_TRANSICIONES = 0.15
+TRANSICIONES_PATH = BASE_DIR / "transiciones_acordes.json"
+
+# perfiles de Krumhansl-Kessler para estimar la tonalidad a partir del chroma total
+_PERFIL_MAYOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_PERFIL_MENOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+
+def estimar_tonalidad(chroma_total):
+    """(tónica, "mayor" | "menor", correlación) o None si no hay nada que medir."""
+    c = np.asarray(chroma_total, dtype=float)
+    if c.size != 12 or c.sum() <= 0 or np.allclose(c, c[0]):
+        return None
+    mejor = None
+    for t in range(12):
+        for modo, perfil in (("mayor", _PERFIL_MAYOR), ("menor", _PERFIL_MENOR)):
+            r = float(np.corrcoef(c, np.roll(perfil, t))[0, 1])
+            if mejor is None or r > mejor[2]:
+                mejor = (t, modo, r)
+    return mejor
+
+
+def acordes_diatonicos(tonica, modo):
+    """Acordes de la tonalidad: los seis de la escala mayor (o de su relativa), el V7 y el
+    III/III7 (la dominante del relativo menor: E/E7 en C mayor o en A menor)."""
+    mayor = tonica if modo == "mayor" else (tonica + 3) % 12
+    grados = [(0, ""), (2, "m"), (4, "m"), (5, ""), (7, ""), (9, "m"), (7, "7"), (4, ""), (4, "7")]
+    return {NOTE_NAMES[(mayor + iv) % 12] + suf for iv, suf in grados}
+
+
+def _sufijo_de_nombre(nombre: str) -> str:
+    return nombre[len(NOTE_NAMES[_raiz_de_nombre(nombre)]):]
+
+
+def _bonus_bajo(chroma_bajo, nombres, peso_bajo, peso_inversion=0.0):
+    """Puntaje extra según la nota que toca el bajo: peso_bajo si es la raíz del acorde y,
+    con la variante de inversiones, peso_inversion si es la 3ª o la 5ª."""
+    raices = np.array([_raiz_de_nombre(n) for n in nombres])
+    bonus = peso_bajo * chroma_bajo[:, raices]
+    if peso_inversion:
+        otras = np.zeros((len(nombres), 12))
+        for j, n in enumerate(nombres):
+            for iv in SUFIJOS_VALIDOS[_sufijo_de_nombre(n)][1:3]:
+                otras[j, (raices[j] + iv) % 12] = 1.0
+        bonus = bonus + peso_inversion * (chroma_bajo[:, None, :] * otras[None, :, :]).max(axis=2)
+    return bonus
+
+
+def conteos_transiciones(segmentos):
+    """Cambios de acorde de una referencia, relativos a la raíz (no dependen de la tonalidad):
+    {"intervalo,calidad_desde,calidad_hacia": veces}. Calidades: 0 mayor, 1 menor, 2 séptima."""
+    clases = [ml_nombre_a_clase(s["acorde"]) for s in sorted(segmentos, key=lambda s: s["inicio"])]
+    clases = [c for c in clases if 0 <= c < ML_CLASE_N]
+    conteos = {}
+    for a, b in zip(clases, clases[1:]):
+        if a == b:
+            continue
+        clave = f"{(b // 3 - a // 3) % 12},{a % 3},{b % 3}"
+        conteos[clave] = conteos.get(clave, 0) + 1
+    return conteos
+
+
+def costos_transicion(conteos, nombres, penalizacion, peso=PESO_TRANSICIONES):
+    """Matriz K x K de costos para _viterbi. Probabilidad de cada destino con suavizado de
+    Laplace sobre los 35 cambios posibles; un cambio equiprobable cuesta la penalización
+    fija, uno frecuente menos (nunca menos de un cuarto) y uno raro más."""
+    clases = [ml_nombre_a_clase(n) for n in nombres]
+    totales = {}
+    for clave, n in conteos.items():
+        q = int(clave.split(",")[1])
+        totales[q] = totales.get(q, 0) + n
+    K = len(nombres)
+    costos = np.zeros((K, K))
+    log_uniforme = np.log(35.0)
+    for i, a in enumerate(clases):
+        for j, b in enumerate(clases):
+            if i == j:
+                continue
+            if not (0 <= a < ML_CLASE_N and 0 <= b < ML_CLASE_N):
+                costos[i, j] = penalizacion
+                continue
+            n = conteos.get(f"{(b // 3 - a // 3) % 12},{a % 3},{b % 3}", 0)
+            p = (n + 1.0) / (totales.get(a % 3, 0) + 35.0)
+            costos[i, j] = max(0.25 * penalizacion, penalizacion + peso * (-np.log(p) - log_uniforme))
+    return costos
+
+
+def leer_transiciones():
+    try:
+        return json.loads(TRANSICIONES_PATH.read_text(encoding="utf-8")).get("conteos") or None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _armar_segmentos(etiquetas, inicios, fin_ultimo, min_duracion):
+    """Etiquetas consecutivas -> [{"inicio", "fin", "acorde"}], fusionando con el anterior los
+    tramos más cortos que min_duracion (ruido). `inicios` es el instante de cada etiqueta;
+    el primer tramo arranca siempre en 0."""
+    n = len(etiquetas)
+    segmentos = []
+    actual, inicio = etiquetas[0], 0.0
+    for i in range(1, n):
+        if etiquetas[i] != actual:
+            segmentos.append({"inicio": round(float(inicio), 2), "fin": round(float(inicios[i]), 2), "acorde": actual})
+            actual, inicio = etiquetas[i], inicios[i]
+    segmentos.append({"inicio": round(float(inicio), 2), "fin": round(float(fin_ultimo), 2), "acorde": actual})
+
+    fusionado = [segmentos[0]]
+    for seg in segmentos[1:]:
+        if seg["fin"] - seg["inicio"] < min_duracion:
+            fusionado[-1]["fin"] = seg["fin"]
+        elif fusionado[-1]["acorde"] == seg["acorde"]:
+            fusionado[-1]["fin"] = seg["fin"]
+        else:
+            fusionado.append(seg)
+    return fusionado
+
+
+def _agrupar_por_tiempo(tiempos, bordes):
+    """Índice del tiempo (intervalo entre bordes) donde cae cada marco, y los intervalos
+    que tienen al menos un marco."""
+    grupo = np.searchsorted(np.asarray(bordes, dtype=float), tiempos, side="right") - 1
+    grupo = np.clip(grupo, 0, len(bordes) - 1)
+    usados = np.unique(grupo)
+    return np.searchsorted(usados, grupo), usados
+
+
+def _decodificar(puntajes, nombres, tiempos, hop_seg, energia, penalizacion, umbral_rel, min_duracion,
+                 beat_times=None, costos=None, percentil_silencio=None, moda=False):
+    """Puntajes por marco (similitud o log-probabilidad, T x K) -> segmentos. Es el mismo
+    armado para los dos detectores: secuencia por Viterbi, silencio por energía, fusión de
+    tramos cortos. Con beat_times (variante "por_tiempo") los cambios solo pueden caer en
+    un tiempo: se suman los puntajes de los marcos de cada tiempo y Viterbi decide sobre
+    tiempos en vez de marcos (la penalización por cambio vale lo mismo en las dos escalas)."""
+    e = np.asarray(energia, dtype=float)
+    if percentil_silencio and e.size:
+        ref = float(np.percentile(e, percentil_silencio))
+    else:
+        ref = float(e.max()) if e.size else 0.0
+    umbral = ref * umbral_rel if ref > 0 else 0.0
+    fin_total = float(tiempos[-1]) + hop_seg
+
+    if beat_times is not None and len(beat_times) >= 2:
+        bordes = [0.0] + [float(b) for b in beat_times if 0.0 < float(b) < fin_total]
+        pos, usados = _agrupar_por_tiempo(tiempos, bordes)
+        S = np.zeros((len(usados), puntajes.shape[1]))
+        np.add.at(S, pos, puntajes)
+        cuantos = np.bincount(pos, minlength=len(usados))
+        e_media = np.bincount(pos, weights=e, minlength=len(usados)) / np.maximum(1, cuantos)
+        idx = _viterbi(S, penalizacion, costos) if (penalizacion or costos is not None) else S.argmax(axis=1)
+        etiquetas = ["—" if en < umbral else nombres[i] for i, en in zip(idx, e_media)]
+        inicios = [bordes[g] for g in usados]
+        return _armar_segmentos(etiquetas, inicios, fin_total, 0.0)
+
+    idx = _viterbi(puntajes, penalizacion, costos) if (penalizacion or costos is not None) else np.argmax(puntajes, axis=1)
+    etiquetas = [nombres[i] for i in idx]
+    etiquetas = ["—" if en < umbral else et for et, en in zip(etiquetas, e)]
+
+    # moda en ventana deslizante: evita que titile entre acordes en cada golpe de púa.
+    # Con Viterbi ya viene suavizado, así que solo se usa en el modo anterior.
+    if moda:
+        n = len(etiquetas)
+        suaves = list(etiquetas)
+        for i in range(n):
+            ini, fin = max(0, i - 2), min(n, i + 3)
+            ventana = etiquetas[ini:fin]
+            suaves[i] = max(set(ventana), key=ventana.count)
+        etiquetas = suaves
+    return _armar_segmentos(etiquetas, tiempos, fin_total, min_duracion)
+
+
+def _puntajes_plantillas(chromas, chroma_bajo=None, peso_bajo=PESO_BAJO, penalizacion_septima=0.0,
+                         variantes=()):
+    """Similitud de cada marco con cada plantilla (T x 36), con los ajustes por bajo, séptima
+    y tonalidad. Devuelve (similitud, nombres)."""
+    plantillas = _plantillas_acordes()
     nombres = list(plantillas.keys())
     M = np.stack([plantillas[n] for n in nombres])
     normas = np.linalg.norm(chromas, axis=1, keepdims=True)
@@ -1332,8 +1603,8 @@ def _clasificar_frames(chromas, plantillas, chroma_bajo=None, peso_bajo=PESO_BAJ
     # único que los separa de verdad es cuál de las dos es la fundamental. Eso
     # el stem de bajo lo dice sin ambigüedad.
     if chroma_bajo is not None and peso_bajo:
-        raices = np.array([_raiz_de_nombre(n) for n in nombres])
-        similitud = similitud + peso_bajo * chroma_bajo[:, raices]
+        similitud = similitud + _bonus_bajo(chroma_bajo, nombres, peso_bajo,
+                                            PESO_BAJO_INVERSION if "bajo_inversiones" in variantes else 0.0)
 
     # Las séptimas se elegían de más (Em -> E7, A -> A7): el séptimo armónico de cualquier nota
     # suma energía justo donde la plantilla de séptima la espera. Se les resta un puntaje fijo,
@@ -1341,6 +1612,18 @@ def _clasificar_frames(chromas, plantillas, chroma_bajo=None, peso_bajo=PESO_BAJ
     if penalizacion_septima:
         similitud = similitud - penalizacion_septima * np.array([1.0 if n.endswith("7") else 0.0 for n in nombres])
 
+    if "tonalidad" in variantes:
+        tonalidad = estimar_tonalidad(chromas.sum(axis=0))
+        if tonalidad:
+            diatonicos = acordes_diatonicos(tonalidad[0], tonalidad[1])
+            similitud = similitud + PESO_TONALIDAD * np.array([1.0 if n in diatonicos else 0.0 for n in nombres])
+    return similitud, nombres
+
+
+def _clasificar_frames(chromas, plantillas, chroma_bajo=None, peso_bajo=PESO_BAJO, penalizacion_cambio=0.0,
+                       penalizacion_septima=0.0):
+    """Acorde de cada marco (sin silencios ni segmentos). Se conserva para lab_acordes.py."""
+    similitud, nombres = _puntajes_plantillas(chromas, chroma_bajo, peso_bajo, penalizacion_septima)
     idx = _viterbi(similitud, penalizacion_cambio) if penalizacion_cambio else np.argmax(similitud, axis=1)
     return [nombres[i] for i in idx]
 
@@ -1389,93 +1672,100 @@ def _comprimir_log(mags, gamma):
     return np.log1p(gamma * mags / ref)
 
 
-def detectar_acordes(wav_path, frame_len=8192, hop=4096, umbral_rel=UMBRAL_SILENCIO, min_duracion=0.35,
-                     bajo_path=None, stems_extra=None, penalizacion_cambio=PENALIZACION_CAMBIO,
-                     penalizacion_septima=PENALIZACION_SEPTIMA, corregir_afinacion=True,
-                     supresion_armonico=SUPRESION_3ER_ARMONICO, compresion_log=None,
-                     tiempos_centrados=None):
-    """Devuelve [{"inicio": s, "fin": s, "acorde": "G"}, ...] a partir de un wav mono/estéreo.
-
-    Si se le pasa el stem de bajo, lo usa para desempatar la fundamental. stems_extra es una
-    lista de wavs (piano, resto) cuyo chroma se suma al de wav_path: en temas donde la guitarra
-    casi no suena, los acordes están en esos stems."""
-    # None = lo que digan las constantes del módulo (así lab_acordes.py puede probar ambos)
-    compresion_log = COMPRESION_LOG if compresion_log is None else compresion_log
-    tiempos_centrados = TIEMPOS_CENTRADOS if tiempos_centrados is None else tiempos_centrados
-
+def _preparar_analisis(wav_path, bajo_path=None, stems_extra=None, frame_len=8192, hop=4096,
+                       corregir_afinacion=True, bandas=False, tiempos_centrados=True):
+    """Lo que comparten los dos detectores (antes estaba duplicado en detectar_acordes y en
+    _features_ml): afinación del tema, magnitudes de las 52 notas sumando la guitarra y los
+    stems extra, energía por marco, chroma del bajo y el instante de cada marco."""
     data, sr = _cargar_wav_mono(wav_path)
+    extras = [Path(x) for x in (stems_extra or [])]
 
     cents = 0.0
     if corregir_afinacion:
-        est, confianza = _estimar_afinacion([wav_path] + list(stems_extra or []))
+        est, confianza = _estimar_afinacion([wav_path] + extras)
         if abs(est) >= AFINACION_MIN_CENTS and confianza >= AFINACION_MIN_CONFIANZA:
             cents = float(np.clip(round(est / 5.0) * 5, -50, 50))
 
-    mags, pitch_class = _mags_de_audio(data, sr, frame_len, hop, cents=cents)
-
-    for extra in stems_extra or []:
+    mags, pitch_class = _mags_de_audio(data, sr, frame_len, hop, cents=cents, bandas=bandas)
+    for extra in extras:
         try:
-            if not Path(extra).exists():
+            if not extra.exists():
                 continue
             data2, sr2 = _cargar_wav_mono(extra)
             if sr2 != sr:
                 continue
-            mags2, _ = _mags_de_audio(data2, sr2, frame_len, hop, cents=cents)
+            mags2, _ = _mags_de_audio(data2, sr2, frame_len, hop, cents=cents, bandas=bandas)
             n_comun = min(mags.shape[0], mags2.shape[0])
             mags = mags[:n_comun] + mags2[:n_comun]
         except Exception:  # noqa: BLE001
             continue   # un stem extra es una ayuda, no un requisito
+
     # cada marco describe lo que suena alrededor de su CENTRO, no de su primera muestra
     centro = frame_len / 2 if tiempos_centrados else 0
     tiempos = (np.arange(mags.shape[0]) * hop + centro) / sr
     # la energía (para decidir silencios) se mide sin la supresión, que solo afecta qué acorde es
     energia = _mags_a_chroma(mags, pitch_class).sum(axis=1)
-    chromas = _mags_a_chroma(
-        _comprimir_log(_suprimir_3er_armonico(mags, supresion_armonico), compresion_log), pitch_class)
 
     chroma_bajo = None
     if bajo_path is not None and Path(bajo_path).exists():
         try:
-            chroma_bajo = _chroma_del_bajo(bajo_path, frame_len, hop, chromas.shape[0], cents=cents)
+            chroma_bajo = _chroma_del_bajo(bajo_path, frame_len, hop, mags.shape[0], cents=cents)
         except Exception:  # noqa: BLE001
             chroma_bajo = None   # el bajo es una ayuda, no un requisito
+    return {"mags": mags, "pitch_class": pitch_class, "energia": energia, "chroma_bajo": chroma_bajo,
+            "tiempos": tiempos, "hop_seg": hop / sr, "cents": cents}
 
-    etiquetas = _clasificar_frames(chromas, _plantillas_acordes(), chroma_bajo,
-                                   penalizacion_cambio=penalizacion_cambio,
-                                   penalizacion_septima=penalizacion_septima)
 
-    umbral = energia.max() * umbral_rel if energia.max() > 0 else 0
-    etiquetas = ["—" if e < umbral else et for et, e in zip(etiquetas, energia)]
+def detectar_acordes(wav_path, frame_len=8192, hop=4096, umbral_rel=UMBRAL_SILENCIO, min_duracion=0.35,
+                     bajo_path=None, stems_extra=None, penalizacion_cambio=PENALIZACION_CAMBIO,
+                     penalizacion_septima=PENALIZACION_SEPTIMA, corregir_afinacion=True,
+                     supresion_armonico=SUPRESION_3ER_ARMONICO, compresion_log=None,
+                     tiempos_centrados=None, variantes=(), beat_times=None, transiciones=None,
+                     detalle=False):
+    """Devuelve [{"inicio": s, "fin": s, "acorde": "G"}, ...] a partir de un wav mono/estéreo.
 
-    # moda en ventana deslizante: evita que titile entre acordes en cada golpe de púa.
-    # Con Viterbi ya viene suavizado, así que solo se usa en el modo anterior.
-    n = len(etiquetas)
-    suaves = list(etiquetas)
-    if not penalizacion_cambio:
-        for i in range(n):
-            ini, fin = max(0, i - 2), min(n, i + 3)
-            ventana = etiquetas[ini:fin]
-            suaves[i] = max(set(ventana), key=ventana.count)
+    Si se le pasa el stem de bajo, lo usa para desempatar la fundamental. stems_extra es una
+    lista de wavs (piano, resto) cuyo chroma se suma al de wav_path: en temas donde la guitarra
+    casi no suena, los acordes están en esos stems.
 
-    hop_seg = hop / sr
-    segmentos = []
-    actual, inicio = suaves[0], 0.0
-    for i in range(1, n):
-        if suaves[i] != actual:
-            segmentos.append({"inicio": round(float(inicio), 2), "fin": round(float(tiempos[i]), 2), "acorde": actual})
-            actual, inicio = suaves[i], tiempos[i]
-    segmentos.append({"inicio": round(float(inicio), 2), "fin": round(float(tiempos[-1]) + hop_seg, 2), "acorde": actual})
+    v115: `variantes` (ver VARIANTES_DETECTOR; vacío = app114 tal cual), `beat_times` para
+    "por_tiempo", `transiciones` (conteos) para "transiciones". Con detalle=True devuelve
+    (segmentos, detalle), donde detalle trae los puntajes por marco para medir la confianza."""
+    variantes = set(variantes or ())
+    # None = lo que digan las constantes del módulo (así lab_acordes.py puede probar ambos)
+    tiempos_centrados = TIEMPOS_CENTRADOS if tiempos_centrados is None else tiempos_centrados
+    prep = _preparar_analisis(wav_path, bajo_path, stems_extra, frame_len, hop, corregir_afinacion,
+                              bandas="bandas_semitono" in variantes, tiempos_centrados=tiempos_centrados)
+    return _detectar_desde_prep(prep, variantes, umbral_rel=umbral_rel, min_duracion=min_duracion,
+                                penalizacion_cambio=penalizacion_cambio, penalizacion_septima=penalizacion_septima,
+                                supresion_armonico=supresion_armonico, compresion_log=compresion_log,
+                                beat_times=beat_times, transiciones=transiciones, detalle=detalle)
 
-    # fusionar tramos cortos (ruido) con el anterior
-    fusionado = [segmentos[0]]
-    for seg in segmentos[1:]:
-        if seg["fin"] - seg["inicio"] < min_duracion:
-            fusionado[-1]["fin"] = seg["fin"]
-        elif fusionado[-1]["acorde"] == seg["acorde"]:
-            fusionado[-1]["fin"] = seg["fin"]
-        else:
-            fusionado.append(seg)
-    return fusionado
+
+def _detectar_desde_prep(prep, variantes=(), umbral_rel=UMBRAL_SILENCIO, min_duracion=0.35,
+                         penalizacion_cambio=PENALIZACION_CAMBIO, penalizacion_septima=PENALIZACION_SEPTIMA,
+                         supresion_armonico=SUPRESION_3ER_ARMONICO, compresion_log=None,
+                         beat_times=None, transiciones=None, detalle=False):
+    """El detector por plantillas a partir de _preparar_analisis (así "Medir mejoras" prepara
+    el audio una sola vez y prueba todas las variantes encima)."""
+    variantes = set(variantes or ())
+    compresion_log = COMPRESION_LOG if compresion_log is None else compresion_log
+    chromas = _mags_a_chroma(
+        _comprimir_log(_suprimir_3er_armonico(prep["mags"], supresion_armonico), compresion_log), prep["pitch_class"])
+    similitud, nombres = _puntajes_plantillas(chromas, prep["chroma_bajo"], penalizacion_septima=penalizacion_septima,
+                                              variantes=variantes)
+    costos = None
+    if "transiciones" in variantes and transiciones:
+        costos = costos_transicion(transiciones, nombres, penalizacion_cambio)
+    segmentos = _decodificar(
+        similitud, nombres, prep["tiempos"], prep["hop_seg"], prep["energia"], penalizacion_cambio,
+        umbral_rel, min_duracion,
+        beat_times=beat_times if "por_tiempo" in variantes else None, costos=costos,
+        percentil_silencio=PERCENTIL_SILENCIO if "silencio_percentil" in variantes else None,
+        moda=not penalizacion_cambio)
+    if detalle:
+        return segmentos, {"puntajes": similitud, "nombres": nombres, "tiempos": prep["tiempos"], "es_logp": False}
+    return segmentos
 
 
 # ------------------------------------------- v109: detector de acordes aprendido ----
@@ -1737,34 +2027,16 @@ class MLModelo:
 
 
 
-def ml_segmentos_desde_logp(logp, tiempos, energia, hop_seg, penalizacion=6.0,
-                         umbral_rel=0.02, min_duracion=0.35):
-    """Mismo armado de segmentos que detectar_acordes de Mesa (silencio por energía,
-    fusión de tramos cortos), con la secuencia decidida por Viterbi sobre log-probs."""
-    idx = _viterbi(logp, penalizacion) if penalizacion else logp.argmax(axis=1)
-    etiquetas = [ml_clase_a_nombre(int(c)) for c in idx]
-    emax = float(np.max(energia)) if len(energia) else 0.0
-    umbral = emax * umbral_rel if emax > 0 else 0.0
-    etiquetas = ["—" if e < umbral else et for et, e in zip(etiquetas, energia)]
+ML_NOMBRES_CLASES = [ml_clase_a_nombre(c) for c in range(ML_N_CLASES)]   # "C", "Cm", "C7", ..., "—"
 
-    n = len(etiquetas)
-    segmentos = []
-    actual, inicio = etiquetas[0], 0.0
-    for i in range(1, n):
-        if etiquetas[i] != actual:
-            segmentos.append({"inicio": round(float(inicio), 2), "fin": round(float(tiempos[i]), 2), "acorde": actual})
-            actual, inicio = etiquetas[i], tiempos[i]
-    segmentos.append({"inicio": round(float(inicio), 2), "fin": round(float(tiempos[-1]) + hop_seg, 2),
-                      "acorde": actual})
-    fusionado = [segmentos[0]]
-    for seg in segmentos[1:]:
-        if seg["fin"] - seg["inicio"] < min_duracion:
-            fusionado[-1]["fin"] = seg["fin"]
-        elif fusionado[-1]["acorde"] == seg["acorde"]:
-            fusionado[-1]["fin"] = seg["fin"]
-        else:
-            fusionado.append(seg)
-    return fusionado
+
+def ml_segmentos_desde_logp(logp, tiempos, energia, hop_seg, penalizacion=6.0,
+                            umbral_rel=0.02, min_duracion=0.35, beat_times=None):
+    """Mismo armado de segmentos que detectar_acordes de Mesa (silencio por energía,
+    fusión de tramos cortos), con la secuencia decidida por Viterbi sobre log-probs.
+    v115: con beat_times, decidida por tiempos del pulso (si el modelo lo eligió al entrenar)."""
+    return _decodificar(logp, ML_NOMBRES_CLASES, tiempos, hop_seg, energia, penalizacion, umbral_rel,
+                        min_duracion, beat_times=beat_times)
 
 
 MODELO_ACORDES_PATH = BASE_DIR / "modelo_acordes.npz"
@@ -1819,45 +2091,17 @@ def _features_ml(wav_path, bajo_path=None, stems_extra=None, frame_len=8192, hop
     suma de stems, supresión del 3er armónico, chroma del bajo). Es la
     misma función que usa el entrenamiento, así los dos ven exactamente lo mismo.
     Devuelve (F, energia, tiempos, hop_seg)."""
-    data, sr = _cargar_wav_mono(wav_path)
-    extras = [Path(x) for x in (stems_extra or [])]
-
-    cents = 0.0
-    est, conf = _estimar_afinacion([wav_path] + extras)
-    if abs(est) >= AFINACION_MIN_CENTS and conf >= AFINACION_MIN_CONFIANZA:
-        cents = float(np.clip(round(est / 5.0) * 5, -50, 50))
-
-    mags, pitch_class = _mags_de_audio(data, sr, frame_len, hop, cents=cents)
-    for extra in extras:
-        try:
-            if not extra.exists():
-                continue
-            d2, sr2 = _cargar_wav_mono(extra)
-            if sr2 != sr:
-                continue
-            m2, _ = _mags_de_audio(d2, sr2, frame_len, hop, cents=cents)
-            n = min(mags.shape[0], m2.shape[0])
-            mags = mags[:n] + m2[:n]
-        except Exception:  # noqa: BLE001
-            continue
-
-    energia = _mags_a_chroma(mags, pitch_class).sum(axis=1)
-    mags_sup = _suprimir_3er_armonico(mags, SUPRESION_3ER_ARMONICO)
-
-    chroma_bajo = None
-    if bajo_path is not None and Path(bajo_path).exists():
-        try:
-            chroma_bajo = _chroma_del_bajo(bajo_path, frame_len, hop, mags.shape[0], cents=cents)
-        except Exception:  # noqa: BLE001
-            chroma_bajo = None
-
-    F = ml_features_marco(mags_sup, pitch_class, chroma_bajo, energia)
-    tiempos = (np.arange(mags.shape[0]) * hop + frame_len / 2) / sr
-    return F, energia, tiempos, hop / sr
+    prep = _preparar_analisis(wav_path, bajo_path, stems_extra, frame_len, hop)
+    mags_sup = _suprimir_3er_armonico(prep["mags"], SUPRESION_3ER_ARMONICO)
+    F = ml_features_marco(mags_sup, prep["pitch_class"], prep["chroma_bajo"], prep["energia"])
+    return F, prep["energia"], prep["tiempos"], prep["hop_seg"]
 
 
-def detectar_acordes_ml(wav_path, modelo, bajo_path=None, stems_extra=None, min_duracion=0.35):
-    """Misma salida que detectar_acordes, decidida por el modelo entrenado."""
+def detectar_acordes_ml(wav_path, modelo, bajo_path=None, stems_extra=None, min_duracion=0.35,
+                        beat_times=None, detalle=False):
+    """Misma salida que detectar_acordes, decidida por el modelo entrenado. v115: si el
+    entrenamiento eligió decidir por tiempos del pulso ("por_tiempo" en el modelo) y hay
+    beat_times, se decide así."""
     F, energia, tiempos, hop_seg = _features_ml(wav_path, bajo_path, stems_extra)
     meta = getattr(modelo, "meta", {}) or {}
     logp = modelo.log_probs(ml_con_contexto(F, _escalas_modelo(meta)))
@@ -1865,22 +2109,220 @@ def detectar_acordes_ml(wav_path, modelo, bajo_path=None, stems_extra=None, min_
     # v111: el umbral de silencio también lo elige el entrenamiento (con 0 decide solo
     # el modelo, que tiene su propia clase "sin acorde"). Modelos viejos: el de siempre.
     umbral = float(meta.get("umbral_silencio", UMBRAL_SILENCIO))
-    return ml_segmentos_desde_logp(logp, tiempos, energia, hop_seg, penalizacion=pen,
-                                   umbral_rel=umbral, min_duracion=min_duracion)
+    por_tiempo = bool(meta.get("por_tiempo")) and beat_times is not None and len(beat_times) >= 2
+    segmentos = ml_segmentos_desde_logp(logp, tiempos, energia, hop_seg, penalizacion=pen,
+                                        umbral_rel=umbral, min_duracion=min_duracion,
+                                        beat_times=beat_times if por_tiempo else None)
+    if detalle:
+        return segmentos, {"puntajes": logp, "nombres": ML_NOMBRES_CLASES, "tiempos": tiempos, "es_logp": True}
+    return segmentos
 
 
 def detectar_acordes_cancion(carpeta):
     """Detector que corresponda según Ajustes generales. Devuelve (segmentos, "aprendido" |
-    "plantillas"). Si el modelo falla por cualquier motivo, cae al de plantillas."""
-    guitarra = carpeta / "guitar.wav"
-    bajo = carpeta / "bass.wav"
-    extras = [carpeta / "piano.wav", carpeta / "other.wav"]
-    if detector_aprendido_activo():
-        try:
-            return detectar_acordes_ml(guitarra, modelo_acordes(), bajo_path=bajo, stems_extra=extras), "aprendido"
-        except Exception as exc:  # noqa: BLE001
-            print(f"[mesa] detector aprendido falló ({exc}); se usa el de plantillas")
-    return detectar_acordes(guitarra, bajo_path=bajo, stems_extra=extras), "plantillas"
+    "plantillas"). Si el modelo falla por cualquier motivo, cae al de plantillas.
+    v115: pasa por el análisis cacheado del tema (ver _analizar_cancion)."""
+    analisis = _analizar_cancion(carpeta)
+    return analisis["segmentos"], analisis["detector"]
+
+
+# ------------------------------------------- v115: análisis de cada tema, cacheado ----
+# Antes el análisis corría entero cada vez que hacía falta: al abrir un tema sin batería
+# (no se guardaba nada), al corregir el tempo (x2, /2, BPM exacto) y al comparar con el
+# MIDI. Ahora acordes + pulso + puntajes por marco quedan en acordes_analisis.npz, con una
+# clave que cambia si cambia cualquier cosa que afecte el resultado (stems, detector
+# elegido, variantes, modelo entrenado, constantes). Se hace apenas termina la separación,
+# así el tema abre listo. Un lock por tema evita que dos dispositivos lo analicen a la vez.
+ANALISIS_VERSION = 1
+ANALISIS_ARCHIVO = "acordes_analisis.npz"
+_LOCKS_TEMA = {}
+_LOCKS_TEMA_LOCK = threading.Lock()
+
+
+def _lock_tema(carpeta):
+    with _LOCKS_TEMA_LOCK:
+        return _LOCKS_TEMA.setdefault(str(Path(carpeta).resolve()), threading.RLock())
+
+
+def variantes_activas():
+    """Variantes del detector por plantillas prendidas en Ajustes generales."""
+    elegidas = {v for v in (leer_prefs().get("detector_variantes") or []) if v in VARIANTES_DETECTOR}
+    if "transiciones" in elegidas and not TRANSICIONES_PATH.exists():
+        elegidas.discard("transiciones")   # todavía no se midió nada de dónde aprenderlas
+    return elegidas
+
+
+def _firma_archivo(ruta):
+    try:
+        st = Path(ruta).stat()
+        return [round(st.st_mtime, 3), st.st_size]
+    except OSError:
+        return None
+
+
+def _clave_analisis(carpeta, usa_modelo, variantes):
+    clave = {
+        "v": ANALISIS_VERSION, "detector": "aprendido" if usa_modelo else "plantillas",
+        "variantes": sorted(variantes),
+        "stems": {n: _firma_archivo(carpeta / f"{n}.wav") for n in ("guitar", "bass", "piano", "other", "drums")},
+        "ajustes": [PENALIZACION_CAMBIO, UMBRAL_SILENCIO, PENALIZACION_SEPTIMA, PESO_BAJO, SUPRESION_3ER_ARMONICO,
+                    COMPRESION_LOG, TIEMPOS_CENTRADOS, TEMPO_PRIOR_BPM, TEMPO_PRIOR_OCTAVAS, PERIODO_FINO,
+                    TEMPO_AMBIGUO, PESO_TONALIDAD, PESO_BAJO_INVERSION, PERCENTIL_SILENCIO, PESO_TRANSICIONES],
+    }
+    if usa_modelo:
+        clave["modelo"] = _firma_archivo(MODELO_ACORDES_PATH)
+    if "transiciones" in variantes:
+        clave["transiciones"] = _firma_archivo(TRANSICIONES_PATH)
+    return json.dumps(clave, sort_keys=True)
+
+
+def _leer_analisis(ruta, clave):
+    if not ruta.exists():
+        return None
+    try:
+        with np.load(ruta, allow_pickle=False) as d:
+            meta = json.loads(str(d["meta"]))
+            if meta.get("clave") != clave:
+                return None
+            puntajes = d["puntajes"].astype(np.float32)
+            tiempos = d["tiempos"]
+            nombres = [str(n) for n in d["nombres"]]
+    except Exception:  # noqa: BLE001
+        return None   # roto o de otra versión: se rehace
+    return {**meta, "puntajes": puntajes, "tiempos": tiempos, "nombres": nombres}
+
+
+def _guardar_analisis(ruta, clave, analisis):
+    meta = {k: v for k, v in analisis.items() if k not in ("puntajes", "tiempos", "nombres")}
+    meta["clave"] = clave
+    try:
+        _guardar_npz(ruta, puntajes=np.asarray(analisis["puntajes"], dtype=np.float16),
+                     tiempos=np.asarray(analisis["tiempos"], dtype=np.float64),
+                     nombres=np.array(analisis["nombres"], dtype=str), meta=np.array(json.dumps(meta)))
+    except OSError as exc:
+        print(f"[mesa] no pude guardar el análisis de {ruta.parent.name} ({exc}); se recalcula la próxima vez")
+
+
+def _analizar_cancion(carpeta):
+    """Acordes y pulso de un tema con el detector que corresponda, de la caché si ya están.
+    Devuelve {segmentos, detector, beat_times, bpm, bpm_alternativo, duracion, puntajes,
+    nombres, tiempos, es_logp}. beat_times son los del pulso (todavía sin elegir el tiempo 1)."""
+    carpeta = Path(carpeta)
+    with _lock_tema(carpeta):
+        usa_modelo = detector_aprendido_activo()
+        variantes = set() if usa_modelo else variantes_activas()
+        clave = _clave_analisis(carpeta, usa_modelo, variantes)
+        ruta = carpeta / ANALISIS_ARCHIVO
+        guardado = _leer_analisis(ruta, clave)
+        if guardado:
+            return guardado
+
+        guitarra, bajo, bateria = carpeta / "guitar.wav", carpeta / "bass.wav", carpeta / "drums.wav"
+        extras = [carpeta / "piano.wav", carpeta / "other.wav"]
+        if bateria.exists():
+            beat_times, bpm, bpm_alt = _detectar_pulso(bateria, detalle=True)
+        else:
+            beat_times, bpm, bpm_alt = [], 0.0, None
+
+        segmentos, detalle, detector = None, None, "plantillas"
+        if usa_modelo:
+            try:
+                segmentos, detalle = detectar_acordes_ml(guitarra, modelo_acordes(), bajo_path=bajo,
+                                                         stems_extra=extras, beat_times=beat_times, detalle=True)
+                detector = "aprendido"
+            except Exception as exc:  # noqa: BLE001
+                print(f"[mesa] detector aprendido falló ({exc}); se usa el de plantillas")
+        if segmentos is None:
+            segmentos, detalle = detectar_acordes(
+                guitarra, bajo_path=bajo, stems_extra=extras, variantes=variantes, beat_times=beat_times,
+                transiciones=leer_transiciones() if "transiciones" in variantes else None, detalle=True)
+
+        analisis = {
+            "segmentos": segmentos, "detector": detector, "variantes": sorted(variantes),
+            "beat_times": [round(float(t), 4) for t in beat_times], "bpm": round(float(bpm), 1),
+            "bpm_alternativo": bpm_alt, "duracion": _duracion_wav(guitarra), "es_logp": detalle["es_logp"],
+            "puntajes": detalle["puntajes"], "nombres": list(detalle["nombres"]), "tiempos": detalle["tiempos"],
+        }
+        _guardar_analisis(ruta, clave, analisis)
+        return analisis
+
+
+# Para mostrar la confianza del detector de plantillas como probabilidad: softmax de la
+# similitud con esta "temperatura" (una diferencia de 0,1 en similitud ~ 12 veces más probable).
+TEMPERATURA_CONFIANZA = 25.0
+CONFIANZA_ARCHIVO = "acordes_confianza.json"
+
+
+def confianza_por_tiempo(analisis, beat_times):
+    """Para cada tiempo de la grilla (beat_times crudos, sin sincronía): probabilidad del
+    acorde más probable según el detector y los 3 mejores candidatos. Sirve para marcar en
+    el editor los compases dudosos y ofrecer alternativas de un toque."""
+    P = np.asarray(analisis["puntajes"], dtype=np.float64)
+    nombres = analisis["nombres"]
+    tiempos = np.asarray(analisis["tiempos"], dtype=float)
+    if not len(beat_times) or not P.size:
+        return [], []
+    if analisis.get("es_logp"):
+        prob = np.exp(P)
+    else:
+        z = P * TEMPERATURA_CONFIANZA
+        z -= z.max(axis=1, keepdims=True)
+        prob = np.exp(z)
+        prob /= prob.sum(axis=1, keepdims=True)
+    es_acorde = np.array([n not in (None, "—") for n in nombres])
+    prob = prob[:, es_acorde]
+    nombres_acorde = [n for n, ok in zip(nombres, es_acorde) if ok]
+
+    beats = np.asarray(beat_times, dtype=float)
+    paso = float(np.median(np.diff(beats))) if len(beats) > 1 else 0.5
+    bordes = np.append(beats, beats[-1] + paso)
+    grupo = np.searchsorted(bordes, tiempos, side="right") - 1
+    dentro = (grupo >= 0) & (grupo < len(beats))
+    S = np.zeros((len(beats), prob.shape[1]))
+    np.add.at(S, grupo[dentro], prob[dentro])
+    cuantos = np.bincount(grupo[dentro], minlength=len(beats))
+    vacios = np.nonzero(cuantos == 0)[0]
+    if len(vacios):   # tiempo sin ningún marco adentro: el marco más cercano
+        cerca = np.clip(np.searchsorted(tiempos, beats[vacios]), 0, len(tiempos) - 1)
+        S[vacios] = prob[cerca]
+    S /= np.maximum(S.sum(axis=1, keepdims=True), 1e-12)
+    orden = np.argsort(-S, axis=1)[:, :3]
+    confianza = [round(float(S[i, orden[i, 0]]), 2) for i in range(len(beats))]
+    alternativas = [[nombres_acorde[j] for j in orden[i]] for i in range(len(beats))]
+    return confianza, alternativas
+
+
+def _guardar_confianza(carpeta, analisis, beat_times):
+    try:
+        confianza, alternativas = confianza_por_tiempo(analisis, beat_times)
+        escribir_atomico(carpeta / CONFIANZA_ARCHIVO, json.dumps({
+            "beat_times": [round(float(t), 3) for t in beat_times], "detector": analisis["detector"],
+            "confianza": confianza, "alternativas": alternativas}))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[mesa] no pude calcular la confianza de {carpeta.name} ({exc})")
+
+
+def _generar_grilla(carpeta, conservar=None):
+    """Analiza el tema (o lo toma de la caché) y escribe acordes.txt, acordes_grid.json y
+    acordes_confianza.json. Devuelve (analisis, tokens, beat_times); sin pulso, beat_times
+    vacío y no se escribe ninguna grilla (los acordes se muestran sin compases)."""
+    carpeta = Path(carpeta)
+    with _lock_tema(carpeta):
+        analisis = _analizar_cancion(carpeta)
+        beat_times = analisis["beat_times"]
+        if not beat_times:
+            return analisis, None, []
+        fase = _elegir_fase_compas(beat_times, analisis["segmentos"])
+        tokens, beat_times = _grid_desde_segmentos(beat_times[fase:], analisis["segmentos"])
+        grid = {"beat_times": beat_times, "beats_por_compas": 4, "bpm": analisis["bpm"],
+                "duracion": analisis["duracion"], "offset": 0.0, "detector": analisis["detector"]}
+        if analisis.get("bpm_alternativo"):
+            grid["bpm_alternativo"] = analisis["bpm_alternativo"]
+        grid.update(conservar or {})
+        escribir_atomico(carpeta / "acordes.txt", _tokens_a_texto(tokens))
+        escribir_atomico(carpeta / "acordes_grid.json", json.dumps(grid))
+        _guardar_confianza(carpeta, analisis, beat_times)
+        return analisis, tokens, beat_times
 
 
 # ------------------------------- v110: entrenar el detector desde Mesa (un botón) ----
@@ -1961,12 +2403,15 @@ def _cache_cancion(carpeta):
                 meta = json.loads(str(d["meta"]))
                 arrays = {k: d[k] for k in d.files if k != "meta"}
             if meta.get("version_features") == ML_VERSION_FEATURES:
-                if meta.get("firma") == firma:
-                    return True
-                if meta.get("firma") is None:
-                    # hecho por los scripts de prueba: mismas features, se adopta tal cual
+                if meta.get("firma") in (firma, None):
+                    # firma None: hecho por los scripts de prueba, mismas features, se adopta.
+                    # v115: los de antes no traen el pulso (para decidir por tiempos): se agrega.
+                    cambio = meta.get("firma") is None or "beats" not in arrays
                     meta["firma"] = firma
-                    _guardar_npz(destino, meta=np.array(json.dumps(meta)), **arrays)
+                    if "beats" not in arrays:
+                        arrays["beats"] = _beats_para_entrenar(carpeta)
+                    if cambio:
+                        _guardar_npz(destino, meta=np.array(json.dumps(meta)), **arrays)
                     return True
         except Exception:  # noqa: BLE001
             pass   # roto o viejo: se rehace
@@ -1980,10 +2425,23 @@ def _cache_cancion(carpeta):
     if base is None:
         return False
     _guardar_npz(destino, F=F.astype(np.float32), y=y, energia=energia.astype(np.float32), tiempos=tiempos,
+                 beats=_beats_para_entrenar(carpeta),
                  meta=np.array(json.dumps({"cancion": carpeta.name, "fuente": fuente, "hop_seg": hop_seg,
                                            "duracion": duracion, "referencia": ref, "base": base,
                                            "version_features": ML_VERSION_FEATURES, "firma": firma})))
     return True
+
+
+def _beats_para_entrenar(carpeta):
+    """Pulso detectado de la batería (lo mismo que usaría Mesa con ese tema), para probar
+    la decisión por tiempos. Vacío si no hay batería."""
+    bateria = carpeta / "drums.wav"
+    if not bateria.exists():
+        return np.zeros(0)
+    try:
+        return np.asarray(_detectar_pulso(bateria)[0], dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        return np.zeros(0)
 
 
 def _guardar_npz(destino, **arrays):
@@ -1997,8 +2455,9 @@ def _cargar_tema_cache(nombre):
     with np.load(ML_CACHE_DIR / f"{nombre}.npz") as d:
         meta = json.loads(str(d["meta"]))
         F, y, energia, tiempos = d["F"], d["y"], d["energia"], d["tiempos"]
+        beats = d["beats"] if "beats" in d.files else np.zeros(0)
     return {"nombre": nombre, "F": F, "y": y.astype(np.int64),
-            "energia": energia, "tiempos": tiempos, "meta": meta}
+            "energia": energia, "tiempos": tiempos, "meta": meta, "beats": beats}
 
 
 def _ml_juntar(temas, escalas, paso=2):
@@ -2076,8 +2535,9 @@ def _entrenar_detector():
         orden = rng.permutation(len(temas))
         k = min(ML_GRUPOS, len(temas))
         grupos = [orden[g::k] for g in range(k)]
-        combos = [(u, p_) for u in ML_UMBRALES for p_ in ML_PENALIZACIONES]
-        # puntajes[(variante, umbral, pen)][tema] = (tríada, global)
+        # v115: además de umbral y penalización, si conviene decidir por tiempos del pulso
+        combos = [(u, p_, pt) for u in ML_UMBRALES for p_ in ML_PENALIZACIONES for pt in (False, True)]
+        # puntajes[(variante, umbral, pen, por_tiempo)][tema] = (tríada, global)
         puntajes = {}
         total = len(ML_VARIANTES) * k
         paso_n = 0
@@ -2093,19 +2553,21 @@ def _entrenar_detector():
                 for j in prueba:
                     t = temas[j]
                     logp = m.log_probs(ml_con_contexto(t["F"], var["escalas"]))
-                    for (u, p_) in combos:
+                    for (u, p_, pt) in combos:
+                        # sin pulso no hay tiempos: se decide por marcos (igual que en Mesa)
+                        beats = t["beats"] if (pt and len(t["beats"]) >= 2) else None
                         seg = ml_segmentos_desde_logp(logp, t["tiempos"], t["energia"], t["meta"]["hop_seg"],
-                                                      penalizacion=p_, umbral_rel=u)
-                        puntajes.setdefault((vi, u, p_), {})[t["nombre"]] = _puntajes_tiempo(
+                                                      penalizacion=p_, umbral_rel=u, beat_times=beats)
+                        puntajes.setdefault((vi, u, p_, pt), {})[t["nombre"]] = _puntajes_tiempo(
                             t["meta"]["referencia"], seg, t["meta"]["duracion"])
 
         def prom(clave, idx):
             return float(np.mean([puntajes[clave][t["nombre"]][idx] for t in temas]))
         mejor = max(puntajes, key=lambda c_: (prom(c_, 1), prom(c_, 0)))
-        vi, umbral, pen = mejor
+        vi, umbral, pen, por_tiempo = mejor
         var = ML_VARIANTES[vi]
         # la configuración de v110 (variante 0, umbral de siempre), para mostrar cuánto se ganó
-        ref_v110 = max(((0, UMBRAL_SILENCIO, p_) for p_ in ML_PENALIZACIONES), key=lambda c_: prom(c_, 1))
+        ref_v110 = max(((0, UMBRAL_SILENCIO, p_, False) for p_ in ML_PENALIZACIONES), key=lambda c_: prom(c_, 1))
 
         base_tri = float(np.mean([t["meta"]["base"]["triada"] for t in temas]))
         base_ex = float(np.mean([t["meta"]["base"]["exacta"] for t in temas]))
@@ -2120,7 +2582,7 @@ def _entrenar_detector():
             "mejoran": sum(1 for v in dif.values() if v > 1), "empeoran": sum(1 for v in dif.values() if v < -1),
             "peores": [{"tema": n, "dif": round(v, 1)} for n, v in sorted(dif.items(), key=lambda x: x[1])[:3] if v < -1],
             "variante": var["nombre"], "umbral_silencio": umbral, "penalizacion": pen,
-            "excluidos": excluidos,
+            "por_tiempo": por_tiempo, "excluidos": excluidos,
         }
 
         guardado = tri_mejor > base_tri
@@ -2130,7 +2592,7 @@ def _entrenar_detector():
             final = MLModelo(X.shape[1], oculta=var["oculta"], semilla=0)
             final.entrenar(X, y, epocas=ML_EPOCAS, semilla=0)
             tmp = MODELO_ACORDES_PATH.with_name("modelo_acordes.tmp.npz")
-            final.guardar(tmp, extra={"penalizacion": pen, "umbral_silencio": umbral,
+            final.guardar(tmp, extra={"penalizacion": pen, "umbral_silencio": umbral, "por_tiempo": por_tiempo,
                                       "escalas": list(var["escalas"]), "contexto": var["escalas"][0],
                                       "variante": var["nombre"], "temas": len(temas), "fecha": resultado["fecha"],
                                       "temas_entrenamiento": [t["nombre"] for t in temas]})
@@ -2171,6 +2633,137 @@ def detector_estado():
     return jsonify(estado)
 
 
+# ------------------------------------------ v115: medir las variantes contra tus MIDI ----
+# Las variantes del detector por plantillas (VARIANTES_DETECTOR) arrancan apagadas: cada
+# una suena bien en teoría, pero lo que mejora un tema empeora otro. Este botón las mide
+# con los temas que tienen un MIDI importado, igual que "Comparar con detector" pero en
+# toda la biblioteca: el detector de siempre, cada variante sola y todas juntas. Las
+# transiciones de cada tema se aprenden de los OTROS temas (si no, se mide con trampa), y
+# al final se guardan las de toda la biblioteca en transiciones_acordes.json.
+MEDICION_PATH = ML_CACHE_DIR / "_ultima_medicion_variantes.json"
+_medicion = {"corriendo": False, "etapa": "", "i": 0, "n": 0, "error": None, "detalle": ""}
+_medicion_lock = threading.Lock()
+
+
+def _medicion_set(**kw):
+    with _medicion_lock:
+        _medicion.update(kw)
+
+
+def _sumar_conteos(*conteos, restar=None):
+    total = {}
+    for c in conteos:
+        for k, v in c.items():
+            total[k] = total.get(k, 0) + v
+    for k, v in (restar or {}).items():
+        total[k] = total.get(k, 0) - v
+    return {k: v for k, v in total.items() if v > 0}
+
+
+def _medir_variantes():
+    try:
+        ML_CACHE_DIR.mkdir(exist_ok=True)
+        raiz = OUTPUT_DIR / MODEL
+        carpetas = sorted(p for p in raiz.iterdir() if p.is_dir() and (p / "guitar.wav").exists())
+        temas = []
+        for c in carpetas:
+            ref = _referencia_midi(c)[0]
+            if ref:
+                temas.append((c, ref))
+        if not temas:
+            raise RuntimeError("no hay ningún tema con un MIDI importado contra el que medir")
+        conteos = {c.name: conteos_transiciones(ref) for c, ref in temas}
+        todos = _sumar_conteos(*conteos.values())
+        configs = [("actual", set())] + [(v, {v}) for v in VARIANTES_DETECTOR] + [("todas", set(VARIANTES_DETECTOR))]
+        puntajes = {nombre: {} for nombre, _ in configs}
+        for i, (c, ref) in enumerate(temas):
+            _medicion_set(etapa="midiendo", i=i, n=len(temas), detalle=c.name)
+            try:
+                kw = {"bajo_path": c / "bass.wav", "stems_extra": [c / "piano.wav", c / "other.wav"]}
+                prep = _preparar_analisis(c / "guitar.wav", **kw)
+                prep_bandas = None
+                bateria = c / "drums.wav"
+                beats = _detectar_pulso(bateria)[0] if bateria.exists() else []
+                duracion = _duracion_wav(c / "guitar.wav")
+                de_los_otros = _sumar_conteos(todos, restar=conteos[c.name])
+                for nombre, variantes in configs:
+                    if "bandas_semitono" in variantes:
+                        if prep_bandas is None:
+                            prep_bandas = _preparar_analisis(c / "guitar.wav", bandas=True, **kw)
+                        base = prep_bandas
+                    else:
+                        base = prep
+                    seg = _detectar_desde_prep(base, variantes, beat_times=beats or None,
+                                               transiciones=de_los_otros if "transiciones" in variantes else None)
+                    puntajes[nombre][c.name] = _puntajes_tiempo(ref, seg, duracion)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[mesa] medición: se saltea {c.name} ({exc})")
+                for nombre in puntajes:
+                    puntajes[nombre].pop(c.name, None)
+
+        # mismo criterio que el entrenamiento: si el detector de siempre coincide tan poco,
+        # casi seguro el MIDI está corrido o es de otra versión del tema
+        actuales = puntajes["actual"]
+        validos = [n for n, (tri, _g) in actuales.items() if tri >= ML_MIN_BASE_TRIADA]
+        excluidos = [{"tema": n, "base": round(tri, 1)} for n, (tri, _g) in actuales.items() if tri < ML_MIN_BASE_TRIADA]
+        if not validos:
+            raise RuntimeError("ningún tema con MIDI sirvió para medir (¿los MIDI están desfasados?)")
+        filas = []
+        for nombre, _ in configs:
+            tri = float(np.mean([puntajes[nombre][t][0] for t in validos]))
+            glo = float(np.mean([puntajes[nombre][t][1] for t in validos]))
+            dif = [puntajes[nombre][t][0] - actuales[t][0] for t in validos]
+            filas.append({"variante": nombre, "triada": round(tri, 1), "global": round(glo, 1),
+                          "mejoran": sum(1 for d in dif if d > 1), "empeoran": sum(1 for d in dif if d < -1)})
+        escribir_atomico(TRANSICIONES_PATH, json.dumps({
+            "conteos": todos, "temas": len(temas), "fecha": datetime.now().strftime("%Y-%m-%d %H:%M")}))
+        resultado = {"fecha": datetime.now().strftime("%Y-%m-%d %H:%M"), "temas": len(validos),
+                     "filas": filas, "excluidos": excluidos}
+        escribir_atomico(MEDICION_PATH, json.dumps(resultado, ensure_ascii=False))
+        _medicion_set(corriendo=False, etapa="listo", error=None)
+    except Exception as exc:  # noqa: BLE001
+        _medicion_set(corriendo=False, etapa="error", error=str(exc))
+
+
+def ultima_medicion():
+    try:
+        return json.loads(MEDICION_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+@app.route("/detector/medir", methods=["POST"])
+def detector_medir():
+    with _medicion_lock:
+        if _medicion["corriendo"]:
+            return jsonify({"error": "ya se está midiendo"}), 409
+        _medicion.update(corriendo=True, etapa="arrancando", i=0, n=0, error=None, detalle="")
+    threading.Thread(target=_medir_variantes, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/detector/medicion")
+def detector_medicion():
+    with _medicion_lock:
+        estado = dict(_medicion)
+    estado.update(ultima=ultima_medicion(), activas=sorted(variantes_activas()),
+                  elegidas=sorted(v for v in (leer_prefs().get("detector_variantes") or []) if v in VARIANTES_DETECTOR),
+                  nombres=VARIANTES_DETECTOR, transiciones=TRANSICIONES_PATH.exists())
+    return jsonify(estado)
+
+
+@app.route("/detector/variantes", methods=["POST"])
+def detector_variantes():
+    """Guarda qué variantes usar. Valen para los temas que se analicen de ahora en más (o al
+    tocar Regenerar): los acordes ya guardados no se tocan."""
+    pedidas = (request.get_json(silent=True) or {}).get("variantes") or []
+    if not isinstance(pedidas, list):
+        return jsonify({"error": "formato inválido"}), 400
+    elegidas = sorted({v for v in pedidas if v in VARIANTES_DETECTOR})
+    guardar_pref("detector_variantes", elegidas)
+    return jsonify({"ok": True, "elegidas": elegidas, "activas": sorted(variantes_activas())})
+
+
 # --------------------------------------------------- pulso, compás y grilla editable ----
 # Detecta el tempo/tiempos a partir de la batería ya separada (spectral flux +
 # autocorrelación — de nuevo, solo numpy). La fase de "tiempo 1" del compás no se
@@ -2183,27 +2776,49 @@ TEMPO_PRIOR_OCTAVAS = 1.0
 PERIODO_FINO = True
 
 
-def _detectar_pulso(wav_path, hop=512, frame=1024, bpm_min=60, bpm_max=200):
+# v115: tempo ambiguo. El error típico del pulso es elegir el doble o la mitad (bombo y
+# caja alternados, platillo en corcheas). Si el pulso alternativo puntúa al menos esta
+# fracción del elegido (con la misma preferencia por ~120 BPM), se guarda como
+# "bpm_alternativo" y la mesa pregunta "¿el pulso va a X BPM?" con un toque para corregir.
+TEMPO_AMBIGUO = 0.4
+
+
+def _detectar_pulso(wav_path, hop=512, frame=1024, bpm_min=60, bpm_max=200, detalle=False):
+    """(beat_times, bpm); con detalle=True, (beat_times, bpm, bpm_alternativo o None)."""
     data, sr = _cargar_wav_mono(wav_path)
     if len(data) < frame:
-        return [], 0.0
-    marcos = sliding_window_view(data, frame)[::hop].copy()
-    marcos *= np.hanning(frame)
-    espectro = np.abs(np.fft.rfft(marcos, axis=1))
-    flujo = np.diff(espectro, axis=0)
-    flujo[flujo < 0] = 0
-    envolvente = np.concatenate([[0.0], flujo.sum(axis=1)])
-    return _pulso_desde_envolvente(envolvente, sr / hop, len(data) / sr, bpm_min, bpm_max)
+        return ([], 0.0, None) if detalle else ([], 0.0)
+    # v115: de a tandas (antes los marcos y su espectro complejo enteros: ~250 MB en un tema
+    # de 4 minutos). La resta entre marcos vecinos cruza la frontera de cada tanda.
+    vista = sliding_window_view(np.asarray(data, dtype=np.float32), frame)[::hop]
+    hann = np.hanning(frame).astype(np.float32)
+    envolvente = np.zeros(vista.shape[0])
+    anterior = None
+    for i in range(0, vista.shape[0], 2048):
+        espectro = np.abs(np.fft.rfft(vista[i:i + 2048] * hann, axis=1))
+        if anterior is not None:
+            espectro_ext = np.vstack([anterior, espectro])
+            flujo = np.diff(espectro_ext, axis=0)
+            destino = slice(i, i + espectro.shape[0])
+        else:
+            flujo = np.diff(espectro, axis=0)
+            destino = slice(1, espectro.shape[0])
+        flujo[flujo < 0] = 0
+        envolvente[destino] = flujo.sum(axis=1)
+        anterior = espectro[-1:]
+    return _pulso_desde_envolvente(envolvente, sr / hop, len(data) / sr, bpm_min, bpm_max, detalle=detalle)
 
 
-def _pulso_desde_envolvente(envolvente, sr_hop, duracion, bpm_min=60, bpm_max=200):
-    """(beat_times, bpm) a partir de la envolvente de ataques de la batería."""
+def _pulso_desde_envolvente(envolvente, sr_hop, duracion, bpm_min=60, bpm_max=200, detalle=False):
+    """(beat_times, bpm) a partir de la envolvente de ataques de la batería. Con detalle=True
+    agrega el BPM alternativo (doble o mitad) si el pulso es ambiguo (ver TEMPO_AMBIGUO)."""
+    sin_pulso = ([], 0.0, None) if detalle else ([], 0.0)
     lag_min = int(sr_hop * 60 / bpm_max)
     lag_max = min(int(sr_hop * 60 / bpm_min), len(envolvente) - 1)
     if lag_max <= lag_min:
-        return [], 0.0
+        return sin_pulso
     if not np.any(envolvente > 0):
-        return [], 0.0   # batería en silencio: sin pulso (se muestran los acordes sin grilla)
+        return sin_pulso   # batería en silencio: sin pulso (se muestran los acordes sin grilla)
 
     ec = envolvente - envolvente.mean()
     # autocorrelación por FFT: mismo resultado que np.correlate(ec, ec, "full"), pero en
@@ -2220,6 +2835,19 @@ def _pulso_desde_envolvente(envolvente, sr_hop, duracion, bpm_min=60, bpm_max=20
         peso = np.exp(-0.5 * (np.log2((60.0 * sr_hop / lags) / TEMPO_PRIOR_BPM) / TEMPO_PRIOR_OCTAVAS) ** 2)
         puntaje = np.maximum(puntaje, 0) * peso
     periodo_grueso = int(lags[int(np.argmax(puntaje))])
+    factor_alternativo = None
+    if detalle:
+        ganador = float(puntaje[periodo_grueso - lag_min])
+        candidatos = []
+        for factor in (2.0, 0.5):
+            lag_alt = periodo_grueso * factor
+            lo, hi = max(lag_min, int(lag_alt * 0.97)), min(lag_max, int(np.ceil(lag_alt * 1.03)))
+            if lo <= hi:
+                candidatos.append((float(puntaje[lo - lag_min:hi - lag_min + 1].max()), factor))
+        if candidatos and ganador > 0:
+            mejor_alt, factor = max(candidatos)
+            if mejor_alt >= TEMPO_AMBIGUO * ganador:
+                factor_alternativo = factor
 
     # Período y fase finos. El período de arriba sale en pasos enteros de ~11,6 ms: a 130 BPM
     # eso es hasta ~1% de error, y como la grilla es de tempo constante, el error se acumula y
@@ -2241,7 +2869,13 @@ def _pulso_desde_envolvente(envolvente, sr_hop, duracion, bpm_min=60, bpm_max=20
 
     n_beats = int(duracion / (periodo / sr_hop)) + 2
     beat_times = [(mejor_fase + i * periodo) / sr_hop for i in range(n_beats)]
-    return [t for t in beat_times if t <= duracion], bpm
+    beat_times = [t for t in beat_times if t <= duracion]
+    if detalle:
+        bpm_alt = round(bpm / factor_alternativo, 1) if factor_alternativo else None
+        if bpm_alt is not None and not (40 <= bpm_alt <= 260):
+            bpm_alt = None
+        return beat_times, bpm, bpm_alt
+    return beat_times, bpm
 
 
 def _afinar_periodo(envolvente, periodo, rango=0.03, paso_rel=0.0005, paso_fase=0.25,
@@ -2801,8 +3435,6 @@ def borrar_cancion(song):
     """Borra los stems separados de una canción y su mp3 original.
     Se lleva puestas las correcciones de acordes, así que el pedido viene con
     doble confirmación desde la interfaz."""
-    import shutil
-
     carpeta = stems_dir(song)
     if not carpeta.exists():
         return jsonify({"error": "esa canción no existe"}), 404
@@ -3183,7 +3815,10 @@ def guardar_mezcla(song):
 @app.route("/acordes/<song>")
 def acordes(song):
     """Lee la grilla editable (acordes.txt) si ya existe; si no, analiza guitarra+batería,
-    genera esa grilla (agrupada por compás) y la cachea junto a los stems."""
+    genera esa grilla (agrupada por compás) y la cachea junto a los stems.
+    v115: normalmente ya está hecha (se analiza al terminar la separación); si no, el
+    análisis se hace una sola vez aunque lo pidan dos dispositivos a la vez, y un tema sin
+    batería ya no se reanaliza cada vez que se abre."""
     carpeta = stems_dir(song)
     guitarra = carpeta / "guitar.wav"
     if not guitarra.exists():
@@ -3191,64 +3826,56 @@ def acordes(song):
 
     txt_path = carpeta / "acordes.txt"
     grid_path = carpeta / "acordes_grid.json"
-
-    if txt_path.exists() and grid_path.exists():
+    if not (txt_path.exists() and grid_path.exists()):
         try:
-            grid = json.loads(grid_path.read_text(encoding="utf-8"))
-            tokens = _texto_a_tokens(txt_path.read_text(encoding="utf-8"))
-            base = grid["beat_times"]
-
-            advertencia = None
-            if len(tokens) != len(base):
-                advertencia = (
-                    f"acordes.txt tiene {len(tokens)} posiciones pero se esperaban {len(base)} — "
-                    "revisá que reemplazaste los cambios borrados por un punto (.) en vez de "
-                    "borrar la posición entera, o usá \"Regenerar\" para volver a empezar."
-                )
-
-            offset = grid.get("offset", 0.0)
-            beat_times = [round(t + offset, 3) for t in base]
-            segmentos = _tokens_a_segmentos(tokens, beat_times, grid.get("duracion", 0))
-            resp = {
-                "segmentos": segmentos, "beat_times": beat_times,
-                "beats_por_compas": grid.get("beats_por_compas", 4),
-                "offset": offset, "bpm": grid.get("bpm"), "capo": grid.get("capo", 0),
-            }
-            if advertencia:
-                resp["advertencia"] = advertencia
-            if isinstance(grid.get("coincidencia"), dict):
-                resp["coincidencia"] = grid["coincidencia"]   # v103: última comparación detector vs MIDI
-            return jsonify(resp)
+            with _lock_tema(carpeta):
+                if not (txt_path.exists() and grid_path.exists()):
+                    analisis, _tokens, beat_times = _generar_grilla(carpeta)
+                    if not beat_times:
+                        # sin batería o sin pulso claro: se muestra igual, pero sin grilla por compás editable
+                        return jsonify({"segmentos": analisis["segmentos"], "beat_times": [], "beats_por_compas": 4,
+                                        "offset": 0.0, "bpm": None, "capo": 0})
         except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"no se pudo leer acordes.txt: {exc}"}), 500
+            return jsonify({"error": f"no se pudo analizar: {exc}"}), 500
+    return _respuesta_acordes(carpeta)
 
+
+def _respuesta_acordes(carpeta):
+    txt_path = carpeta / "acordes.txt"
+    grid_path = carpeta / "acordes_grid.json"
     try:
-        segmentos_detectados, detector_usado = detectar_acordes_cancion(carpeta)
-        data_dur, sr_dur = _cargar_wav_mono(guitarra)
-        duracion = len(data_dur) / sr_dur
+        grid = json.loads(grid_path.read_text(encoding="utf-8"))
+        tokens = _texto_a_tokens(txt_path.read_text(encoding="utf-8"))
+        base = grid["beat_times"]
 
-        bateria = carpeta / "drums.wav"
-        beat_times, _bpm = _detectar_pulso(bateria) if bateria.exists() else ([], 0.0)
+        advertencia = None
+        if len(tokens) != len(base):
+            advertencia = (
+                f"acordes.txt tiene {len(tokens)} posiciones pero se esperaban {len(base)} — "
+                "revisá que reemplazaste los cambios borrados por un punto (.) en vez de "
+                "borrar la posición entera, o usá \"Regenerar\" para volver a empezar."
+            )
 
-        if not beat_times:
-            # sin batería o sin pulso claro: se muestra igual, pero sin grilla por compás editable
-            return jsonify({"segmentos": segmentos_detectados, "beat_times": [], "beats_por_compas": 4, "offset": 0.0, "bpm": None, "capo": 0})
-
-        fase = _elegir_fase_compas(beat_times, segmentos_detectados)
-        beat_times = beat_times[fase:]
-        tokens, beat_times = _grid_desde_segmentos(beat_times, segmentos_detectados)
-
-        escribir_atomico(txt_path, _tokens_a_texto(tokens))
-        escribir_atomico(
-            grid_path,
-            json.dumps({"beat_times": beat_times, "beats_por_compas": 4, "bpm": round(_bpm, 1), "duracion": duracion, "offset": 0.0,
-                        "detector": detector_usado}),
-        )
-
-        segmentos = _tokens_a_segmentos(tokens, beat_times, duracion)
-        return jsonify({"segmentos": segmentos, "beat_times": beat_times, "beats_por_compas": 4, "offset": 0.0, "bpm": round(_bpm, 1), "capo": 0})
+        offset = grid.get("offset", 0.0)
+        beat_times = [round(t + offset, 3) for t in base]
+        segmentos = _tokens_a_segmentos(tokens, beat_times, grid.get("duracion", 0))
+        resp = {
+            "segmentos": segmentos, "beat_times": beat_times,
+            "beats_por_compas": grid.get("beats_por_compas", 4),
+            "offset": offset, "bpm": grid.get("bpm"), "capo": grid.get("capo", 0),
+            "origen": grid.get("origen") or "detector",
+        }
+        if advertencia:
+            resp["advertencia"] = advertencia
+        if isinstance(grid.get("coincidencia"), dict):
+            resp["coincidencia"] = grid["coincidencia"]   # v103: última comparación detector vs MIDI
+        if grid.get("bpm_alternativo") and grid.get("origen") != "midi":
+            resp["bpm_alternativo"] = grid["bpm_alternativo"]   # v115: "¿el pulso va a X BPM?"
+        if (carpeta / RESPALDO_DIR / "acordes.txt").exists():
+            resp["hay_respaldo"] = True
+        return jsonify(resp)
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"no se pudo analizar: {exc}"}), 500
+        return jsonify({"error": f"no se pudo leer acordes.txt: {exc}"}), 500
 
 
 @app.route("/tempo_acordes/<song>", methods=["POST"])
@@ -3277,10 +3904,12 @@ def tempo_acordes(song):
         periodo_nuevo = float(np.median(np.diff(base))) / factor
         bpm_nuevo = 60.0 / periodo_nuevo
 
-        segmentos_detectados, detector_usado = detectar_acordes_cancion(carpeta)
-        data_dur, sr_dur = _cargar_wav_mono(guitarra)
-        duracion = len(data_dur) / sr_dur
+        # v115: los acordes salen del análisis cacheado (antes se volvía a correr el detector entero)
+        analisis = _analizar_cancion(carpeta)
+        segmentos_detectados, detector_usado = analisis["segmentos"], analisis["detector"]
+        duracion = analisis["duracion"]
 
+        _respaldar_acordes(carpeta, "tempo")
         fase_tiempo = base[0] % periodo_nuevo
         n_beats = int(duracion / periodo_nuevo) + 2
         beat_times = [t for t in (fase_tiempo + i * periodo_nuevo for i in range(n_beats)) if t <= duracion]
@@ -3299,6 +3928,7 @@ def tempo_acordes(song):
                         "offset": grid_actual.get("offset", 0.0), "capo": grid_actual.get("capo", 0),
                         "detector": detector_usado}),
         )
+        _guardar_confianza(carpeta, analisis, beat_times)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
     return acordes(song)   # misma respuesta que da la carga normal, leída de lo recién guardado
@@ -3326,33 +3956,87 @@ def regenerar_acordes(song):
     """Borra acordes.txt y la grilla, y fuerza un reanálisis completo desde cero.
     v112: la cejilla se conserva (es del tema, igual que al corregir el tempo) y
     las marcas de rasgueo se corren para que sigan en el mismo punto del audio:
-    la grilla nueva arranca con sincronía 0."""
+    la grilla nueva arranca con sincronía 0.
+    v115: antes de borrar se guarda una copia (botón "Deshacer"), y el análisis sale de la
+    caché si nada cambió desde la última vez (mismo resultado, sin esperar)."""
     carpeta = stems_dir(song)
+    if not (carpeta / "guitar.wav").exists():
+        return jsonify({"error": "no hay pista de guitarra para esta canción"}), 404
+    with _lock_tema(carpeta):
+        try:
+            grid_viejo = json.loads((carpeta / "acordes_grid.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            grid_viejo = {}
+        _respaldar_acordes(carpeta, "regenerar")
+        for nombre in ("acordes.txt", "acordes_grid.json", CONFIANZA_ARCHIVO):
+            p = carpeta / nombre
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError as exc:
+                    return jsonify({"error": f"no pude borrar {nombre}: {exc}. ¿Lo tenés abierto en el editor? Cerralo e intentá de nuevo."}), 500
+        _anclar_marcas_rasgueo(carpeta, grid_viejo.get("offset", 0.0))
+        capo = grid_viejo.get("capo", 0)
+        try:
+            _generar_grilla(carpeta, conservar={"capo": capo} if capo else None)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"no se pudo analizar: {exc}"}), 500
+    return acordes(song)
+
+
+# ------------------------------------------------ v115: deshacer (una copia por tema) ----
+# Regenerar, importar un MIDI y corregir el tempo reemplazan acordes.txt entero: las
+# correcciones a mano se perdían sin vuelta atrás. Antes de cada una se copia lo que hay a
+# .respaldo/ (una sola copia: la de la última operación) y la mesa ofrece "Deshacer".
+RESPALDO_DIR = ".respaldo"
+_ARCHIVOS_RESPALDO = ("acordes.txt", "acordes_grid.json", "rasgueo_marcas.json", "acordes_midi.json",
+                      CONFIANZA_ARCHIVO)
+
+
+def _respaldar_acordes(carpeta: Path, motivo: str) -> bool:
+    if not (carpeta / "acordes.txt").exists():
+        return False   # no hay nada propio que perder
+    destino = carpeta / RESPALDO_DIR
     try:
-        grid_viejo = json.loads((carpeta / "acordes_grid.json").read_text(encoding="utf-8"))
+        destino.mkdir(exist_ok=True)
+        presentes = []
+        for nombre in _ARCHIVOS_RESPALDO:
+            origen = carpeta / nombre
+            if origen.exists():
+                shutil.copy2(origen, destino / nombre)
+                presentes.append(nombre)
+            elif (destino / nombre).exists():
+                (destino / nombre).unlink()
+        escribir_atomico(destino / "respaldo.json", json.dumps({
+            "archivos": presentes, "motivo": motivo, "fecha": datetime.now().strftime("%Y-%m-%d %H:%M")}))
+        return True
+    except OSError as exc:
+        print(f"[mesa] no pude guardar la copia de los acordes de {carpeta.name} ({exc})")
+        return False
+
+
+@app.route("/deshacer_acordes/<song>", methods=["POST"])
+def deshacer_acordes(song):
+    """Vuelve los acordes a como estaban antes de la última operación que los reemplazó."""
+    carpeta = stems_dir(song)
+    origen = carpeta / RESPALDO_DIR
+    try:
+        info = json.loads((origen / "respaldo.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        grid_viejo = {}
-    for nombre in ("acordes.txt", "acordes_grid.json"):
-        p = carpeta / nombre
-        if p.exists():
-            try:
-                p.unlink()
-            except OSError as exc:
-                return jsonify({"error": f"no pude borrar {nombre}: {exc}. ¿Lo tenés abierto en el editor? Cerralo e intentá de nuevo."}), 500
-    _anclar_marcas_rasgueo(carpeta, grid_viejo.get("offset", 0.0))
-    resp = acordes(song)
-    capo = grid_viejo.get("capo", 0)
-    grid_path = carpeta / "acordes_grid.json"
-    if capo and grid_path.exists():
-        with _LOCK_DATOS:
-            try:
-                grid = json.loads(grid_path.read_text(encoding="utf-8"))
-                grid["capo"] = capo
-                escribir_atomico(grid_path, json.dumps(grid))
-            except (OSError, json.JSONDecodeError):
-                return resp
-        return acordes(song)   # relee lo guardado, ya con la cejilla
-    return resp
+        return jsonify({"error": "no hay nada para deshacer en este tema"}), 404
+    with _lock_tema(carpeta), _LOCK_DATOS:
+        try:
+            for nombre in _ARCHIVOS_RESPALDO:
+                if nombre in info.get("archivos", []):
+                    tmp = carpeta / (nombre + ".tmp")
+                    shutil.copy2(origen / nombre, tmp)
+                    os.replace(tmp, carpeta / nombre)
+                elif (carpeta / nombre).exists():
+                    (carpeta / nombre).unlink()
+            shutil.rmtree(origen, ignore_errors=True)
+        except OSError as exc:
+            return jsonify({"error": f"no pude volver atrás: {exc}"}), 500
+    return acordes(song)
 
 
 def _anclar_marcas_rasgueo(carpeta: Path, offset_viejo):
@@ -3906,8 +4590,7 @@ def importar_midi(song):
     if not segmentos:
         return jsonify({"error": "el MIDI no tiene acordes reconocibles"}), 400
 
-    data, sr = _cargar_wav_mono(guitarra)
-    duracion = len(data) / sr
+    duracion = _duracion_wav(guitarra)
 
     # La grilla se ancla a los cambios de acorde reales del MIDI en vez de imponer
     # un tempo constante: así cada cambio cae exactamente en un tiempo y no se
@@ -3969,7 +4652,12 @@ def importar_midi(song):
     if sobra:
         tokens, beat_times = tokens[:-sobra], beat_times[:-sobra]
 
+    respaldado = _respaldar_acordes(carpeta, "midi")   # v115: "Deshacer" vuelve a los acordes de antes
     escribir_atomico((carpeta / "acordes.txt"), _tokens_a_texto(tokens))
+    try:
+        (carpeta / CONFIANZA_ARCHIVO).unlink()   # el MIDI manda: no hay compases "dudosos"
+    except OSError:
+        pass
     grid_previo = {}
     grid_path = carpeta / "acordes_grid.json"
     if grid_path.exists():
@@ -3995,7 +4683,7 @@ def importar_midi(song):
     for s in simplificados:
         resumen[s] = resumen.get(s, 0) + 1
     return jsonify({
-        "ok": True, "bpm": round(bpm, 1), "acordes": len(segmentos),
+        "ok": True, "bpm": round(bpm, 1), "acordes": len(segmentos), "hay_respaldo": respaldado,
         "simplificados": [f"{k} ({v}×)" for k, v in sorted(resumen.items(), key=lambda x: -x[1])],
     })
 
@@ -4119,9 +4807,14 @@ def comparar_detector(song):
     try:
         referencia = [{"inicio": float(s["inicio"]) + corrimiento, "fin": float(s["fin"]) + corrimiento,
                        "acorde": s["acorde"]} for s in referencia]
+        # v115: con las variantes prendidas en Ajustes generales (lo que de verdad usaría Mesa)
+        variantes = variantes_activas()
+        beats_pulso = _analizar_cancion(carpeta)["beat_times"]
         detectados = detectar_acordes(
             guitarra, bajo_path=carpeta / "bass.wav",
-            stems_extra=[carpeta / "piano.wav", carpeta / "other.wav"])
+            stems_extra=[carpeta / "piano.wav", carpeta / "other.wav"],
+            variantes=variantes, beat_times=beats_pulso,
+            transiciones=leer_transiciones() if "transiciones" in variantes else None)
         duracion_cmp = detectados[-1]["fin"]
         resultado = _comparar_acordes(referencia, detectados, duracion_cmp)
     except Exception as exc:  # noqa: BLE001
@@ -4136,7 +4829,8 @@ def comparar_detector(song):
     if modelo is not None:
         try:
             det_ml = detectar_acordes_ml(guitarra, modelo, bajo_path=carpeta / "bass.wav",
-                                         stems_extra=[carpeta / "piano.wav", carpeta / "other.wav"])
+                                         stems_extra=[carpeta / "piano.wav", carpeta / "other.wav"],
+                                         beat_times=beats_pulso)
             r_ml = _comparar_acordes(referencia, det_ml, duracion_cmp)
             if r_ml is not None:
                 entreno = (getattr(modelo, "meta", {}) or {}).get("temas_entrenamiento") or []
@@ -4217,7 +4911,7 @@ def obtener_grilla(song):
         inicio = round(base[idx_beat] + offset, 3) if idx_beat < len(base) else None
         compases.append({"tokens": tokens[i:i + bpc], "inicio": inicio})
 
-    return jsonify({
+    resp = {
         "compases": compases,
         "beats_por_compas": bpc,
         "vocabulario": _vocabulario_completo(),
@@ -4227,7 +4921,43 @@ def obtener_grilla(song):
         # marcas de rasgueo
         "beat_times": base,
         "offset": offset,
-    })
+    }
+    # v115: qué tan seguro estaba el detector en cada tiempo, y sus 3 candidatos. Solo si la
+    # grilla sigue siendo la del detector (con un MIDI importado no hay nada que dudar).
+    confianza = _leer_confianza(carpeta, base, grid)
+    if confianza:
+        resp["confianza"] = confianza["confianza"]
+        resp["alternativas"] = confianza["alternativas"]
+    return jsonify(resp)
+
+
+def _leer_confianza(carpeta, base, grid):
+    if grid.get("origen") == "midi":
+        return None
+    try:
+        datos = json.loads((carpeta / CONFIANZA_ARCHIVO).read_text(encoding="utf-8"))
+        tiempos = datos.get("beat_times") or []
+        if len(tiempos) != len(base) or (base and max(abs(a - b) for a, b in zip(tiempos, base)) > 0.01):
+            return None   # es de otra grilla (cambió el tempo a mano en el .txt, etc.)
+        return datos
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+@app.route("/tempo_descartar/<song>", methods=["POST"])
+def tempo_descartar(song):
+    """v115: "No, el pulso está bien": deja de preguntar por el BPM alternativo."""
+    grid_path = stems_dir(song) / "acordes_grid.json"
+    if not grid_path.exists():
+        return jsonify({"error": "esta canción todavía no tiene grilla de acordes"}), 404
+    with _LOCK_DATOS:
+        try:
+            grid = json.loads(grid_path.read_text(encoding="utf-8"))
+            grid.pop("bpm_alternativo", None)
+            escribir_atomico(grid_path, json.dumps(grid))
+        except (OSError, json.JSONDecodeError) as exc:
+            return jsonify({"error": str(exc)}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/grilla/<song>", methods=["POST"])
@@ -4262,11 +4992,35 @@ def guardar_grilla(song):
 
     bpc = grid.get("beats_por_compas", 4)
     try:
+        previos = _texto_a_tokens(txt_path.read_text(encoding="utf-8")) if txt_path.exists() else []
+    except OSError:
+        previos = []
+    try:
         escribir_atomico(txt_path, _tokens_a_texto(normalizados, beats_por_compas=bpc))
     except OSError as exc:
         return jsonify({"error": f"no pude guardar acordes.txt: {exc}. ¿Lo tenés abierto en otro editor?"}), 500
 
+    # v115: lo que corregiste o marcaste como revisado deja de figurar como dudoso
+    revisados = {int(c) for c in (datos.get("revisados") or []) if isinstance(c, int) or str(c).isdigit()}
+    cambiados = {i // bpc for i, t in enumerate(normalizados) if i >= len(previos) or previos[i] != t}
+    _marcar_revisados(carpeta, grid, revisados | cambiados, bpc)
     return jsonify({"ok": True})
+
+
+def _marcar_revisados(carpeta, grid, compases, bpc):
+    if not compases:
+        return
+    datos = _leer_confianza(carpeta, grid["beat_times"], grid)
+    if not datos:
+        return
+    conf = datos["confianza"]
+    for c in compases:
+        for i in range(c * bpc, min(len(conf), (c + 1) * bpc)):
+            conf[i] = 1.0
+    try:
+        escribir_atomico(carpeta / CONFIANZA_ARCHIVO, json.dumps(datos))
+    except OSError:
+        pass
 
 
 def _beats_base(carpeta: Path):
@@ -6639,6 +7393,103 @@ BASE_STYLE = """<!doctype html>
   #columna-pistas{ transition:filter .45s ease, opacity .45s ease; }
   body.cajon-abierto #columna-pistas{ filter:grayscale(1) brightness(.55); opacity:.8; pointer-events:none; user-select:none; }
 </style>
+<style id="estilo-v115">
+  /* ======================================================================
+     v115 — última capa. Aviso con botón, aviso de tempo, "analizando",
+     compases dudosos en el editor y (más abajo) el armado para tablet
+     vertical, rótulos táctiles y la ayuda de atajos.
+     ====================================================================== */
+  #mesa-toast .toast-accion{
+    margin-left:12px; padding:4px 12px; border-radius:999px; border:1px solid currentColor;
+    background:transparent; color:inherit; font:inherit; font-weight:700; cursor:pointer;
+  }
+  .aviso-tempo{ display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:8px 14px; text-align:left; }
+  .aviso-tempo-botones{ display:flex; gap:8px; flex-wrap:wrap; }
+  .acordes-display.analizando::after{
+    content:"Analizando acordes y pulso…"; position:absolute; left:0; right:0; bottom:10px;
+    text-align:center; font-size:13px; color:var(--fg-dim); animation:mesa-latido 1.6s ease-in-out infinite;
+  }
+  .acordes-display{ position:relative; }
+  @keyframes mesa-latido{ 50%{ opacity:.45; } }
+  @media (prefers-reduced-motion: reduce){ .acordes-display.analizando::after{ animation:none; } }
+
+  /* editor: compases dudosos y alternativas del detector */
+  .compas.dudoso{ border-color:color-mix(in srgb, var(--brass) 70%, transparent); border-style:dashed; }
+  .compas-dudoso{
+    margin-left:auto; width:22px; height:22px; border-radius:50%; border:0; cursor:pointer;
+    background:var(--brass); color:var(--sobre-acento); font-weight:800; font-size:13px; line-height:22px; padding:0;
+  }
+  .compas-alternativas{ display:none; flex-wrap:wrap; align-items:center; gap:6px; margin-top:8px; }
+  .compas-alternativas.visible{ display:flex; }
+  .alt-titulo{ font-size:11.5px; color:var(--fg-dim); margin-right:2px; }
+  .alt-chip{
+    min-width:44px; min-height:32px; padding:4px 10px; border-radius:999px; cursor:pointer;
+    border:1px solid var(--linea-fuerte); background:var(--panel-2); color:var(--fg);
+    font-family:var(--mono); font-size:13px;
+  }
+  .alt-chip.actual{ border-color:var(--brass); color:var(--brass); }
+  .compas.destello{ animation:mesa-destello 1.2s ease; }
+  @keyframes mesa-destello{ 0%, 40%{ box-shadow:0 0 0 3px var(--brass); } 100%{ box-shadow:0 0 0 0 transparent; } }
+
+  /* la línea "C mayor · I – V – vi…" iba arriba a la derecha y se pisaba con el
+     grado del acorde siguiente: ahora va abajo a la derecha */
+  @media (min-width: 1100px){
+    body.modo-tocar .linea-progresion{ top:auto; bottom:12px; right:18px; }
+  }
+
+  /* próximos compases */
+  .proximos{
+    --escp:1; --por-fila:4;
+    display:grid; grid-template-columns:repeat(var(--por-fila), minmax(0, 1fr));
+    gap:calc(6px * var(--escp)); margin:12px 0 0; padding:calc(8px * var(--escp)); max-width:none;
+    background:var(--panel); border:0; border-radius:20px;
+  }
+  .prox-compas{
+    position:relative; display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); align-items:end;
+    height:calc(50px * var(--escp)); padding:0 calc(4px * var(--escp)) calc(6px * var(--escp));
+    border:0; border-left:2px solid var(--linea-fuerte); border-radius:10px; background:transparent;
+    color:var(--fg); font:inherit; text-align:left; cursor:pointer;
+  }
+  .prox-compas:hover{ background:rgba(var(--tinta),.05); }
+  .prox-compas.actual{ background:rgba(var(--tinta),.09); border-left-color:var(--brass); }
+  .prox-num{
+    position:absolute; top:calc(3px * var(--escp)); left:calc(6px * var(--escp));
+    font-family:var(--mono); font-size:calc(10px * var(--escp)); color:var(--fg-tenue);
+  }
+  .prox-tiempo{
+    position:relative; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:clip;
+    padding:0 calc(3px * var(--escp)); font-family:var(--mono); font-weight:700;
+    font-size:calc(19px * var(--escp)); line-height:1.15;
+  }
+  .prox-tiempo.silencio{ color:var(--fg-tenue); font-weight:500; }
+  .prox-tiempo.activo::after{
+    content:""; position:absolute; left:calc(3px * var(--escp)); right:calc(6px * var(--escp));
+    bottom:calc(-5px * var(--escp)); height:3px; border-radius:2px; background:var(--brass);
+  }
+  .prox-compas.actual .prox-tiempo:not(.silencio){ color:var(--brass); }
+
+  /* con los próximos compases, cartel y compases se centran juntos en el alto */
+  body.modo-tocar.con-proximos .acordes-display{ margin-bottom:0; }
+  body.modo-tocar.con-proximos .proximos{ margin-bottom:auto; }
+  /* con el editor abierto, el lugar es para el editor */
+  body:has(#panel-editor[style*="block"]) .proximos{ display:none !important; }
+  /* en el celular, la fila de vista (cinta, compases, cuenta) va solo con íconos:
+     con el botón nuevo ya no entraba al lado del transporte */
+  @media (max-width: 600px){
+    #barra-estudio > .estudio-grupo:last-child .btn-ico-lbl{ font-size:0; gap:0; min-width:42px; min-height:44px; padding:6px; }
+  }
+
+  /* cartel en dos pisos para el celular (body.cartel-angosto lo pone el JS) */
+  body.cartel-angosto .fila-acordes{ height:calc(190px * var(--esc)); }
+  body.cartel-angosto #acorde-actual{ top:36%; }
+  body.cartel-angosto #acorde-siguiente{
+    top:84%; left:50%; transform:translate(-50%, -50%); font-size:calc(54px * var(--esc));
+  }
+  body.cartel-angosto .grado-chico{ top:calc(36% - 74px * var(--esc)); }
+  body.cartel-angosto .grado-chico-sig{ display:none; }
+  body.cartel-angosto .diagrama{ top:36%; left:calc(50% - 205px * var(--esc)); }
+  body.cartel-angosto .diagrama-sig{ top:84%; left:calc(50% + 78px * var(--esc)); }
+</style>
 <script>
 // v102: botón de modo claro / oscuro. Se agrega solo en la cabecera de cada
 // pantalla (portada, setlist, mesa); si una pantalla no tiene cabecera, queda
@@ -6737,10 +7588,23 @@ window.mesaAviso = function(texto, opciones){
     document.body.appendChild(el);
   }
   el.textContent = texto;
+  // v115: un botón opcional dentro del aviso, ej. { accion: { texto: "Deshacer", alHacer } }
+  if(o.accion && o.accion.texto){
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "toast-accion";
+    b.textContent = o.accion.texto;
+    b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      el.classList.remove("visible");
+      try{ o.accion.alHacer(); }catch(e){ console.warn(e); }
+    });
+    el.appendChild(b);
+  }
   el.classList.toggle("error", !!o.error);
   el.classList.add("visible");
   clearTimeout(el._temporizador);
-  el._temporizador = setTimeout(() => el.classList.remove("visible"), o.duracion || (o.error ? 8000 : 4500));
+  el._temporizador = setTimeout(() => el.classList.remove("visible"), o.duracion || (o.error ? 8000 : (o.accion ? 9000 : 4500)));
 };
 
 // Registra el service worker (necesario para que Chrome/Android ofrezcan
@@ -7124,8 +7988,29 @@ PANEL_GENERALES_HTML = """<div class="panel panel-plegable{{ ' colapsado' if gen
           <button id="entrenar-detector" type="button" class="boton-chico" title="Aprende de los temas que tienen un MIDI importado (Chordify). Corre en la PC; podés seguir usando Mesa.">Entrenar con mis MIDI</button>
         </div>
         <span id="detector-estado" class="grupo-nota"></span>
+        <!-- v115: variantes del detector por plantillas, medidas contra los MIDI propios -->
+        <details class="detector-variantes" id="detector-variantes">
+          <summary>Mejoras experimentales del detector por plantillas</summary>
+          <span class="grupo-nota">Arrancan apagadas. «Medir» las prueba con todos los temas que tienen un MIDI importado y muestra cuánto coincide cada una; prendé las que ganan. Valen para los temas que se analicen de ahora en más (o al tocar Regenerar). Con el detector aprendido prendido no se usan: ahí el entrenamiento elige solo si decide por tiempos.</span>
+          <div class="grupo-fila">
+            <button id="medir-variantes" type="button" class="boton-chico" title="Corre en la PC; podés seguir usando Mesa.">Medir con mis MIDI</button>
+          </div>
+          <span id="variantes-estado" class="grupo-nota"></span>
+          <div id="variantes-lista" class="variantes-lista"></div>
+        </details>
       </div>
     </div>
+    <style>
+      .detector-variantes{ margin-top:10px; border-top:1px solid var(--linea); padding-top:10px; }
+      .detector-variantes summary{ cursor:pointer; font-size:13px; font-weight:600; color:var(--fg); list-style-position:inside; }
+      .detector-variantes[open] summary{ margin-bottom:8px; }
+      .variantes-lista{ display:flex; flex-direction:column; gap:6px; margin-top:8px; }
+      .variante-fila{ display:flex; flex-wrap:wrap; align-items:center; gap:6px 12px; }
+      .variante-fila .boton-chico{ flex:0 1 auto; text-align:left; }
+      .variante-dato{ font-family:var(--mono); font-size:12px; color:var(--fg-dim); }
+      .variante-dato.gana{ color:var(--ok); }
+      .variante-dato.pierde{ color:var(--led-mute); }
+    </style>
     <script>
     // v110: detector aprendido. Este script viaja con el panel, así funciona igual
     // en la portada y en la mesa.
@@ -7150,6 +8035,7 @@ PANEL_GENERALES_HTML = """<div class="panel panel-plegable{{ ' colapsado' if gen
           + (typeof u.v110_triada === "number" ? ` (con la configuración anterior daba ${u.v110_triada}%).` : ".");
         if(u.excluidos && u.excluidos.length) t += ` Quedaron afuera ${u.excluidos.length} con el MIDI probablemente desfasado: `
           + u.excluidos.map(x => x.tema).join(", ") + ".";
+        if(u.por_tiempo) t += " Decide los cambios en los tiempos del pulso.";
         if(!u.guardado) t += " No le ganó al de plantillas: se mantuvo el modelo anterior.";
         return t;
       }
@@ -7195,6 +8081,102 @@ PANEL_GENERALES_HTML = """<div class="panel panel-plegable{{ ' colapsado' if gen
         consultar();
       });
       consultar();
+    })();
+
+    // v115: medir y elegir las variantes del detector por plantillas
+    (function(){
+      const lista = document.getElementById("variantes-lista");
+      const btn = document.getElementById("medir-variantes");
+      const est = document.getElementById("variantes-estado");
+      if(!lista || !btn || !est) return;
+      let elegidas = new Set();
+      let timer = null;
+      function pintar(d){
+        elegidas = new Set(d.elegidas || []);
+        const filas = {};
+        ((d.ultima && d.ultima.filas) || []).forEach(f => { filas[f.variante] = f; });
+        const base = filas.actual;
+        lista.innerHTML = "";
+        Object.entries(d.nombres || {}).forEach(([clave, nombre]) => {
+          const fila = document.createElement("div");
+          fila.className = "variante-fila";
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "boton-chico interruptor" + (elegidas.has(clave) ? " destacado" : "");
+          b.innerHTML = '<span class="interruptor-pista"></span>';
+          b.append(document.createTextNode(nombre));
+          if(clave === "transiciones" && !d.transiciones){
+            b.disabled = true;
+            b.title = "Primero tocá «Medir»: las transiciones se aprenden de tus MIDI";
+          }
+          b.addEventListener("click", () => guardar(clave, !elegidas.has(clave)));
+          const dato = document.createElement("span");
+          dato.className = "variante-dato";
+          const f = filas[clave];
+          if(f && base){
+            const dif = f.triada - base.triada;
+            dato.textContent = `${f.triada}% (${dif >= 0 ? "+" : ""}${dif.toFixed(1)}) · mejoran ${f.mejoran}, empeoran ${f.empeoran}`;
+            dato.classList.add(dif > 0.2 ? "gana" : (dif < -0.2 ? "pierde" : "igual"));
+          } else {
+            dato.textContent = "sin medir";
+          }
+          fila.append(b, dato);
+          lista.append(fila);
+        });
+        if(d.corriendo){
+          btn.disabled = true;
+          const paso = d.n ? ` ${Math.min(d.i + 1, d.n)}/${d.n}` : "";
+          est.textContent = `Midiendo${paso}…` + (d.detalle ? ` (${d.detalle})` : "");
+          return;
+        }
+        btn.disabled = false;
+        if(d.etapa === "error" && d.error){ est.textContent = "No se pudo medir: " + d.error; return; }
+        const u = d.ultima;
+        if(u && base){
+          const todas = filas.todas;
+          est.textContent = `Última medición (${u.fecha}, ${u.temas} temas): el detector de siempre coincide ${base.triada}%`
+            + (todas ? `; con todas juntas, ${todas.triada}%.` : ".")
+            + (u.excluidos && u.excluidos.length ? ` Quedaron afuera ${u.excluidos.length} con el MIDI probablemente desfasado.` : "");
+        } else {
+          est.textContent = "Todavía no se midió. Hace falta al menos un tema con un MIDI importado.";
+        }
+      }
+      async function guardar(clave, prender){
+        const nuevas = new Set(elegidas);
+        if(prender) nuevas.add(clave); else nuevas.delete(clave);
+        try{
+          const r = await fetch("/detector/variantes", { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ variantes: [...nuevas] }) });
+          if(!r.ok) throw new Error(`HTTP ${r.status}`);
+          consultar();
+        }catch(e){
+          if(window.mesaAviso) mesaAviso("No se pudo guardar: " + e.message, { error: true });
+        }
+      }
+      async function consultar(){
+        try{
+          const r = await fetch("/detector/medicion", { cache: "no-store" });
+          const d = await r.json();
+          pintar(d);
+          if(d.corriendo && !timer) timer = setInterval(consultar, 2000);
+          if(!d.corriendo && timer){ clearInterval(timer); timer = null; }
+        }catch(e){ /* sin conexión con la PC */ }
+      }
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        est.textContent = "Arrancando…";
+        try{
+          const r = await fetch("/detector/medir", { method: "POST" });
+          const d = await r.json().catch(() => ({}));
+          if(!r.ok && r.status !== 409) throw new Error(d.error || `HTTP ${r.status}`);
+        }catch(e){
+          est.textContent = "No se pudo arrancar: " + e.message;
+          btn.disabled = false;
+          return;
+        }
+        consultar();
+      });
+      document.getElementById("detector-variantes").addEventListener("toggle", consultar, { once: true });
     })();
     </script>
 
@@ -8512,6 +9494,7 @@ PROCESANDO_HTML = BASE_STYLE + """
     cargando: "cargando el modelo",
     separando: "separando",
     mp3: "preparando las pistas",
+    acordes: "detectando acordes y pulso",
   };
 
   let fallosSeguidos = 0;
@@ -8657,7 +9640,20 @@ MESA_HTML = BASE_STYLE + """
   <div id="linea-progresion" class="linea-progresion" style="display:none;"></div>
 </div>
 
+<!-- v115: los compases que vienen, en el alto que sobra debajo del cartel (tablet
+     vertical, monitor). La fila de arriba es siempre la del compás que suena;
+     tocar un compás salta ahí. -->
+<div id="proximos" class="panel proximos" aria-label="Próximos compases" style="display:none;"></div>
+
 <div id="acordes-advertencia" class="aviso" style="display:none;"></div>
+<!-- v115: el pulso pudo salir al doble o a la mitad: se pregunta en vez de adivinar -->
+<div id="aviso-tempo" class="aviso aviso-tempo" style="display:none;" role="status">
+  <span id="aviso-tempo-texto"></span>
+  <span class="aviso-tempo-botones">
+    <button id="aviso-tempo-si" type="button" class="boton-chico destacado"></button>
+    <button id="aviso-tempo-no" type="button" class="boton-chico">No, está bien</button>
+  </span>
+</div>
 
 <!-- 2. Editor de acordes: se abre desde el cajón de ajustes y aparece acá,
         debajo del cartel, para editar mirando el compás que suena. -->
@@ -8666,6 +9662,7 @@ MESA_HTML = BASE_STYLE + """
     <span class="editor-titulo">Editor de acordes</span>
     <span style="flex:1;"></span>
     <span id="editor-estado" class="editor-estado">&nbsp;</span>
+    <button id="editor-dudoso" type="button" class="boton-chico" style="display:none;" title="Ir al próximo compás donde el detector no estaba seguro"></button>
     <button id="editor-guardar" class="boton-chico destacado">Guardar</button>
     <button id="editor-cerrar" class="boton-chico">Cerrar</button>
   </div>
@@ -8726,6 +9723,7 @@ MESA_HTML = BASE_STYLE + """
     <div class="estudio-grupo">
       <span class="estudio-tit">Vista</span>
       <button id="toggle-cinta" class="boton-chico btn-ico-lbl{{ ' destacado' if vista_cinta else '' }}" title="Vista cinta"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M8 7v10M13 7v10M18 7v10"/></svg>Cinta</button>
+      <button id="toggle-proximos" class="boton-chico btn-ico-lbl destacado" title="Mostrar los próximos compases debajo del cartel (P)"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M9 4v7M15 4v7M9 13v7M15 13v7"/></svg>Compases</button>
       <button id="toggle-cuenta" class="boton-chico btn-ico-lbl{{ ' destacado' if cuenta_regresiva else '' }}" title="Cuenta regresiva 4-3-2-1"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9.5 2h5"/></svg>Cuenta 4</button>
     </div>
   </div>
@@ -8890,7 +9888,7 @@ MESA_HTML = BASE_STYLE + """
   btnCerrar.addEventListener("click", () => abrirCajon(false));
   // mientras el cajón está abierto, lo principal queda deshabilitado de verdad
   // (no solo gris): inert saca foco y clics de cabecera, cartel y transporte
-  const principales = [".cabecera-mesa", ".setlist-nav", ".acordes-display", "#panel-transporte", "#panel-editor", "#acordes-advertencia", "#columna-pistas"]
+  const principales = [".cabecera-mesa", ".setlist-nav", ".acordes-display", "#proximos", "#panel-transporte", "#panel-editor", "#acordes-advertencia", "#aviso-tempo", "#columna-pistas"]
     .map(s => document.querySelector(s)).filter(Boolean);
   function inertes(si){ principales.forEach(el => { if(si) el.setAttribute("inert", ""); else el.removeAttribute("inert"); }); }
   new MutationObserver(() => inertes(document.body.classList.contains("cajon-abierto")))
@@ -10297,7 +11295,8 @@ document.getElementById("archivo-midi").addEventListener("change", async (e) => 
       msg += "\\n\\nSe simplificaron al vocabulario de Mesa:\\n" + d.simplificados.join("\\n");
     }
     msg += "\\n\\nSi los acordes quedan corridos respecto al audio, ajustalo con los botones de Sincronía.";
-    mesaAviso(msg, { duracion: 20000 });
+    if(d.hay_respaldo) avisoConDeshacer(msg, { duracion: 20000 });
+    else mesaAviso(msg, { duracion: 20000 });
   }catch(err){
     mesaAviso("No se pudo importar: " + err.message, { error: true });
   }finally{
@@ -10410,12 +11409,52 @@ function estadoRasgueoEn(pos){
   return "";
 }
 
+// v115: "¿el pulso va a X BPM?" cuando el detector duda entre un tempo y su doble o mitad
+function pintarAvisoTempo(alternativo){
+  const el = document.getElementById("aviso-tempo");
+  if(!el) return;
+  if(!alternativo || !bpmActual){ el.style.display = "none"; return; }
+  const alt = Math.round(alternativo);
+  document.getElementById("aviso-tempo-texto").textContent =
+    `El pulso detectado va a ${Math.round(bpmActual)} BPM, pero podría ser ${alt}. Si los compases duran el doble o la mitad de lo que suenan, corregilo.`;
+  const si = document.getElementById("aviso-tempo-si");
+  si.textContent = `Pasar a ${alt} BPM`;
+  si.dataset.factor = String(alternativo / bpmActual);
+  el.style.display = "";
+}
+document.getElementById("aviso-tempo-si").addEventListener("click", async (e) => {
+  const factor = Number(e.currentTarget.dataset.factor);
+  if(!(factor > 0)) return;
+  document.getElementById("aviso-tempo").style.display = "none";
+  await corregirTempo(factor, e.currentTarget);
+});
+document.getElementById("aviso-tempo-no").addEventListener("click", async () => {
+  document.getElementById("aviso-tempo").style.display = "none";
+  await postConAviso(`/tempo_descartar/{{ song }}`);
+});
+
+// v115: "Deshacer" después de regenerar, importar un MIDI o corregir el tempo
+async function deshacerAcordes(){
+  if(await postConAviso(`/deshacer_acordes/{{ song }}`)){
+    await cargarAcordes();
+    await cargarRasgueo();
+    if(panelEditor.style.display === "block") await abrirEditor();
+    mesaAviso("Listo: los acordes volvieron a como estaban.");
+  }
+}
+function avisoConDeshacer(texto, opciones){
+  mesaAviso(texto, Object.assign({ duracion: 12000 }, opciones || {}, { accion: { texto: "Deshacer", alHacer: deshacerAcordes } }));
+}
+
 async function cargarAcordes(){
+  if(!acordes.length) mostrarAnalizando(true);   // v115: la primera vez puede tardar unos segundos
   try{
     const r = await fetch(`/acordes/{{ song }}`);
     const datos = r.ok ? await r.json() : {};
     acordes = Array.isArray(datos.segmentos) ? datos.segmentos : [];
     beatTimes = Array.isArray(datos.beat_times) ? datos.beat_times : [];
+    versionAcordes++;
+    ajustarEscalaTocar();   // v115: con o sin grilla cambia si hay lugar para los próximos compases
     beatsPorCompas = datos.beats_por_compas || 4;
     offsetActual = typeof datos.offset === "number" ? datos.offset : 0;
     actualizarOffsetUI();
@@ -10427,6 +11466,7 @@ async function cargarAcordes(){
     if(datos.advertencia){ adv.textContent = datos.advertencia; adv.style.display = "block"; }
     else { adv.style.display = "none"; }
     pintarCoincidencia(datos.coincidencia);   // v103: última comparación guardada, si hay
+    pintarAvisoTempo(datos.bpm_alternativo);  // v115
 
     // recalcular la tonalidad y refrescar la línea de progresión + los grados
     detectarTonalidad();
@@ -10444,6 +11484,12 @@ async function cargarAcordes(){
     // a encajar en el compás más cercano en vez de quedar a mitad de camino
     if(typeof reencajarLoop === "function") reencajarLoop();
   }catch(e){ /* sin acordes por ahora, no pasa nada */ }
+  finally{ mostrarAnalizando(false); }
+}
+// v115: mientras se analiza el tema el cartel lo dice, en vez de una raya muda
+function mostrarAnalizando(si){
+  const cartel = document.querySelector(".acordes-display");
+  if(cartel) cartel.classList.toggle("analizando", !!si);
 }
 cargarAcordes();
 
@@ -10475,6 +11521,11 @@ let vocabulario = [], comienzosCompas = [], haycambios = false;
 let rasgueoEditorSet = new Set();   // posiciones (0-indexadas) editadas acá; se manda al backend recién al Guardar
 let celdasPorPosicion = [], totalPosicionesEditor = 0;
 let beatsBaseEditor = [];   // tiempos crudos (sin offset) de cada posición de la grilla
+// v115: confianza del detector por posición (0..1) y sus 3 candidatos. Un compás con algún
+// tiempo por debajo de UMBRAL_DUDOSO se marca para revisarlo primero.
+const UMBRAL_DUDOSO = 0.6;
+let confianzaEditor = [], alternativasEditor = [], compasesRevisados = new Set();
+let contenedorAltAbierto = null;
 
 // El editor trabaja por celda, pero las marcas se guardan por tiempo. Estas dos
 // hacen la traducción: al abrir, cada tiempo guardado se pega a la celda más
@@ -10591,17 +11642,87 @@ function validarCelda(celda){
   return ok;
 }
 
+function marcarRevisado(iC){
+  if(compasesRevisados.has(iC)) return;
+  compasesRevisados.add(iC);
+  const div = editorGrilla.querySelector(`.compas[data-indice="${iC}"]`);
+  if(div){
+    div.classList.remove("dudoso");
+    const b = div.querySelector(".compas-dudoso");
+    if(b) b.remove();
+  }
+  actualizarBotonDudoso();
+}
+
+function actualizarBotonDudoso(){
+  const btn = document.getElementById("editor-dudoso");
+  if(!btn) return;
+  const n = editorGrilla.querySelectorAll(".compas.dudoso").length;
+  btn.style.display = n ? "" : "none";
+  btn.textContent = `${n} ${n === 1 ? "dudoso" : "dudosos"} ›`;
+}
+
+document.getElementById("editor-dudoso").addEventListener("click", () => {
+  const dudosos = Array.from(editorGrilla.querySelectorAll(".compas.dudoso"));
+  if(!dudosos.length) return;
+  // el siguiente al que está más arriba en pantalla; al final, vuelve al primero
+  const tope = editorGrilla.getBoundingClientRect().top + 8;
+  const sig = dudosos.find(d => d.getBoundingClientRect().top > tope + 4) || dudosos[0];
+  ultimoScrollManual = performance.now();   // que el seguimiento automático no lo saque de ahí
+  sig.scrollIntoView({ block: "center", behavior: "smooth" });
+  sig.classList.remove("destello"); void sig.offsetWidth; sig.classList.add("destello");
+});
+
+function mostrarAlternativas(contenedor, posicion, inp, iC){
+  if(contenedorAltAbierto && contenedorAltAbierto !== contenedor){
+    contenedorAltAbierto.innerHTML = "";
+    contenedorAltAbierto.classList.remove("visible");
+  }
+  contenedorAltAbierto = contenedor;
+  contenedor.innerHTML = "";
+  const lista = alternativasEditor[posicion];
+  if(!Array.isArray(lista) || !lista.length){ contenedor.classList.remove("visible"); return; }
+  const actual = normalizarAcorde(inp.value.trim() || inp.placeholder || "");
+  const tit = document.createElement("span");
+  tit.className = "alt-titulo";
+  tit.textContent = "Según el detector:";
+  contenedor.appendChild(tit);
+  lista.forEach(alt => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "alt-chip" + (alt === actual ? " actual" : "");
+    b.textContent = alt;
+    // pointerdown sin foco: así la celda no pierde el foco antes del click
+    b.addEventListener("pointerdown", (ev) => ev.preventDefault());
+    b.addEventListener("click", () => {
+      inp.value = alt;
+      validarCelda(inp);
+      refrescarHerencia();
+      marcarSinGuardar();
+      marcarRevisado(iC);
+      mostrarAlternativas(contenedor, posicion, inp, iC);
+    });
+    contenedor.appendChild(b);
+  });
+  contenedor.classList.add("visible");
+}
+
 function construirGrilla(datos){
   vocabulario = datos.vocabulario || [];
   comienzosCompas = datos.compases.map(c => c.inicio);
   editorGrilla.innerHTML = "";
   celdasPorPosicion = [];
+  confianzaEditor = Array.isArray(datos.confianza) ? datos.confianza : [];
+  alternativasEditor = Array.isArray(datos.alternativas) ? datos.alternativas : [];
+  compasesRevisados = new Set();
+  contenedorAltAbierto = null;
   let posGlobal = 0;
 
   datos.compases.forEach((compas, iC) => {
     const div = document.createElement("div");
     div.className = "compas";
     div.dataset.indice = iC;
+    const posInicio = posGlobal;
 
     const cab = document.createElement("div");
     cab.className = "compas-cab";
@@ -10629,8 +11750,26 @@ function construirGrilla(datos){
     }
     div.appendChild(cab);
 
+    // v115: compás dudoso (el detector no estaba seguro en algún tiempo con acorde)
+    const confs = compas.tokens.map((tok, k) => confianzaEditor[posInicio + k])
+      .filter((c, k) => typeof c === "number" && compas.tokens[k] !== "—");
+    const minima = confs.length ? Math.min(...confs) : 1;
+    if(minima < UMBRAL_DUDOSO){
+      div.classList.add("dudoso");
+      const badge = document.createElement("button");
+      badge.type = "button";
+      badge.className = "compas-dudoso";
+      badge.textContent = "?";
+      badge.title = `El detector no estaba seguro acá (${Math.round(minima * 100)}%). Tocá una celda para ver sus otras opciones, o tocá acá para marcarlo como revisado.`;
+      badge.setAttribute("aria-label", "Compás dudoso: marcar como revisado");
+      badge.addEventListener("click", () => { marcarRevisado(iC); marcarSinGuardar(); });
+      cab.appendChild(badge);
+    }
+
     const celdas = document.createElement("div");
     celdas.className = "compas-celdas";
+    const alternativas = document.createElement("div");
+    alternativas.className = "compas-alternativas";
     compas.tokens.forEach(tok => {
       const posicion = posGlobal++;
 
@@ -10642,7 +11781,8 @@ function construirGrilla(datos){
       inp.type = "text";
       inp.maxLength = 6;   // "C#maj7"
       inp.value = (tok === ".") ? "" : tok;   // v103: el "—" se muestra, no se confunde con vacío
-      inp.addEventListener("input", () => { validarCelda(inp); refrescarHerencia(); marcarSinGuardar(); });
+      inp.addEventListener("input", () => { validarCelda(inp); refrescarHerencia(); marcarSinGuardar(); marcarRevisado(iC); });
+      inp.addEventListener("focus", () => mostrarAlternativas(alternativas, posicion, inp, iC));
       inp.addEventListener("blur", () => {
         const v = inp.value.trim();
         if(esSilencioCelda(v)) inp.value = "—";
@@ -10673,10 +11813,12 @@ function construirGrilla(datos){
       celdas.appendChild(wrap);
     });
     div.appendChild(celdas);
+    div.appendChild(alternativas);
     editorGrilla.appendChild(div);
   });
 
   totalPosicionesEditor = posGlobal;
+  actualizarBotonDudoso();
   aplicarPintadoRasgueo();
   refrescarHerencia();
   haycambios = false;
@@ -10746,7 +11888,7 @@ document.getElementById("editor-guardar").addEventListener("click", async (e) =>
     const r = await fetch(`/grilla/{{ song }}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tokens }),
+      body: JSON.stringify({ tokens, revisados: Array.from(compasesRevisados) }),
     });
     const d = await r.json();
     if(!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
@@ -10884,14 +12026,17 @@ function confirmarEnBoton(boton, textoAviso, accion){
 // decía; se avisa en el primer toque, que es cuando todavía se puede frenar.
 function avisarRedeteccion(boton){
   if(boton.dataset.confirmando === "1") return;
-  mesaAviso("Corregir el tempo vuelve a detectar los acordes: se pierden las correcciones hechas a mano y lo importado de un MIDI. La cejilla, la sincronía y las marcas de rasgueo se conservan.", { duracion: 7000 });
+  mesaAviso("Corregir el tempo vuelve a detectar los acordes: reemplaza las correcciones hechas a mano y lo importado de un MIDI (después vas a poder deshacerlo). La cejilla, la sincronía y las marcas de rasgueo se conservan.", { duracion: 7000 });
 }
 
 async function corregirTempo(factor, boton){
   const original = boton.textContent;
   boton.disabled = true;
   boton.textContent = "recalculando…";
-  if(await postConAviso(`/tempo_acordes/{{ song }}`, { factor })) await cargarAcordes();
+  if(await postConAviso(`/tempo_acordes/{{ song }}`, { factor })){
+    await cargarAcordes();
+    avisoConDeshacer(`Grilla recalculada a ${bpmActual ? bpmActual.toFixed(1) : "?"} BPM.`);
+  }
   boton.disabled = false;
   boton.textContent = original;
 }
@@ -10916,7 +12061,11 @@ async function ejecutarRegenerar(boton){
   const original = boton.textContent;
   boton.disabled = true;
   boton.textContent = "regenerando…";
-  if(await postConAviso(`/regenerar_acordes/{{ song }}`)){ await cargarAcordes(); await cargarRasgueo(); }
+  if(await postConAviso(`/regenerar_acordes/{{ song }}`)){
+    await cargarAcordes(); await cargarRasgueo();
+    if(panelEditor.style.display === "block") await abrirEditor();
+    avisoConDeshacer("Acordes detectados de nuevo.");
+  }
   boton.disabled = false;
   boton.textContent = original;
 }
@@ -11959,6 +13108,7 @@ function tick(){
   });
 
   resaltarCompasActual(pos);
+  pintarProximos(pos);
 }
 requestAnimationFrame(tick);
 
@@ -11970,6 +13120,103 @@ requestAnimationFrame(tick);
 // letras enormes y en la tablet da lo que entre, sin duplicar reglas ni tener
 // una versión distinta para cada uno.
 const btnModoTocar = document.getElementById("toggle-modo-tocar");
+
+// ------------------------- v115: próximos compases -------------------------
+// Debajo del cartel, en el alto que sobra: filas de compases con el acorde de cada
+// tiempo donde cambia. La fila de arriba es la del compás que suena y la ventana
+// avanza de a una fila entera (no se mueve todo a cada compás). Tocar un compás
+// salta ahí. Se prende y apaga con "Compases" en la barra de abajo (o la tecla P).
+const elProximos = document.getElementById("proximos");
+let verProximos = true;
+try{ verProximos = localStorage.getItem("mesaProximos") !== "0"; }catch(e){}
+let versionAcordes = 0;
+let proximosFilas = 0, proximosPorFila = 4, proximosFirma = "", proximosBeatPintado = -2;
+
+function proximosEscala(anchoDisp, porFila){
+  return Math.max(0.75, Math.min(1.8, (anchoDisp - 40) / (porFila * 4 * 62)));
+}
+
+function configurarProximos(filas, escP){
+  proximosPorFila = document.body.classList.contains("cartel-angosto") ? 2 : 4;
+  proximosFilas = filas;
+  const visible = filas > 0;
+  elProximos.style.display = visible ? "" : "none";
+  document.body.classList.toggle("con-proximos", visible);
+  if(visible){
+    elProximos.style.setProperty("--por-fila", proximosPorFila);
+    elProximos.style.setProperty("--escp", (escP || 1).toFixed(3));
+  }
+  proximosFirma = "";
+  document.getElementById("toggle-proximos").classList.toggle("destacado", verProximos);
+}
+
+function armarProximos(desde, bpc, totalCompases){
+  elProximos.textContent = "";
+  const hasta = Math.min(totalCompases, desde + proximosFilas * proximosPorFila);
+  for(let b = desde; b < hasta; b++){
+    const c = document.createElement("button");
+    c.type = "button";
+    c.className = "prox-compas";
+    c.dataset.compas = b;
+    c.title = `Ir al compás ${b + 1}`;
+    const num = document.createElement("span");
+    num.className = "prox-num";
+    num.textContent = b + 1;
+    c.appendChild(num);
+    let anterior = null;
+    for(let k = 0; k < bpc; k++){
+      const i = b * bpc + k;
+      const t = beatTimes[i];
+      const seg = typeof t === "number" ? acordeEnPosicion(t + 0.02) : null;
+      const nombre = seg ? formaDeAcorde(seg.acorde) : "—";
+      const cel = document.createElement("span");
+      cel.className = "prox-tiempo";
+      cel.dataset.beat = i;
+      if(k === 0 || nombre !== anterior){
+        cel.textContent = nombre;
+        if(nombre === "—") cel.classList.add("silencio");
+      } else {
+        cel.classList.add("sigue");
+      }
+      anterior = nombre;
+      c.appendChild(cel);
+    }
+    c.addEventListener("click", () => saltarA(beatTimes[b * bpc]));
+    elProximos.appendChild(c);
+  }
+}
+
+function pintarProximos(pos){
+  if(!proximosFilas) return;
+  const bpc = beatsPorCompas || 4;
+  const totalCompases = Math.floor(beatTimes.length / bpc);
+  if(!totalCompases) return;
+  const iBeat = indiceBeatEnPosicion(pos);
+  const compas = Math.min(totalCompases - 1, Math.max(0, Math.floor(Math.max(0, iBeat) / bpc)));
+  const desde = compas - (compas % proximosPorFila);
+  const firma = `${desde}|${proximosFilas}|${proximosPorFila}|${versionAcordes}|${capoActual}`;
+  if(firma !== proximosFirma){
+    armarProximos(desde, bpc, totalCompases);
+    proximosFirma = firma;
+    proximosBeatPintado = -2;
+  }
+  if(iBeat !== proximosBeatPintado){
+    const previo = elProximos.querySelector(".prox-tiempo.activo");
+    if(previo) previo.classList.remove("activo");
+    const previoC = elProximos.querySelector(".prox-compas.actual");
+    if(previoC) previoC.classList.remove("actual");
+    const cel = iBeat >= 0 ? elProximos.querySelector(`.prox-tiempo[data-beat="${iBeat}"]`) : null;
+    if(cel){ cel.classList.add("activo"); cel.parentNode.classList.add("actual"); }
+    proximosBeatPintado = iBeat;
+  }
+}
+
+function alternarProximos(){
+  verProximos = !verProximos;
+  try{ localStorage.setItem("mesaProximos", verProximos ? "1" : "0"); }catch(e){}
+  ajustarEscalaTocar();
+}
+document.getElementById("toggle-proximos").addEventListener("click", alternarProximos);
 
 // Espacio que ocupa lo que NO es el cartel: cabecera, transporte, barra de
 // estudio y márgenes. Se mide en vivo para no depender de un número mágico.
@@ -11984,6 +13231,8 @@ function altoFueraDelCartel(){
   return alto;
 }
 
+// v115: alto de una fila de "próximos compases" a escala 1 (más el margen del panel)
+const ALTO_FILA_PROXIMOS = 58, MARGEN_PROXIMOS = 28;
 function ajustarEscalaTocar(){
   const tocando = document.body.classList.contains("modo-tocar");
   // a escala 1 el bloque mide ~680x220: los diagramas van de 50%-230 a
@@ -11991,17 +13240,41 @@ function ajustarEscalaTocar(){
   // v107: con las pistas al costado, el cartel tiene menos ancho
   const colPistas = document.getElementById("columna-pistas");
   const anchoCol = (document.body.classList.contains("pistas-al-lado") && colPistas) ? colPistas.offsetWidth + 20 : 0;
-  const anchoDisp = Math.max(320, window.innerWidth - 40 - anchoCol);
+  const anchoDisp = Math.max(300, window.innerWidth - 40 - anchoCol);
+  // v115: en el celular el cartel se arma en dos pisos (acorde arriba, el que
+  // viene abajo) y entra en 420 de ancho en vez de 680: el acorde sale ~50% más grande
+  const angosto = anchoDisp < 560;
+  document.body.classList.toggle("cartel-angosto", angosto);
+  const anchoBase = angosto ? 420 : 680;
+  const altoBase = (angosto ? 280 : 220) + (document.body.classList.contains("vista-cinta") ? 30 : 0);   // v87: la cinta suma ~30px netos
+  let filasProximos = 0;
   if(!tocando){
     // fuera de modo tocar el cartel nunca crece más allá del tamaño de
     // siempre, pero en pantallas angostas (celular, tablet en vertical) se
     // achica lo justo para entrar sin desbordar ni forzar scroll horizontal
-    escalaVisual = Math.min(1, anchoDisp / 680);
+    escalaVisual = Math.min(1, anchoDisp / anchoBase);
   } else {
     const altoDisp = Math.max(180, window.innerHeight - altoFueraDelCartel());
-    const altoBase = document.body.classList.contains("vista-cinta") ? 250 : 220;   // v87: la cinta suma ~30px netos
-    escalaVisual = Math.max(0.4, Math.min(anchoDisp / 680, altoDisp / altoBase, 3));   // v86: también achica
+    const escalaCon = alto => Math.max(0.4, Math.min(anchoDisp / anchoBase, alto / altoBase, 3));   // v86: también achica
+    escalaVisual = escalaCon(altoDisp);
+    // v115: el alto que sobra va a los próximos compases. Si no sobra, se le saca un
+    // poco al cartel para mostrar al menos dos filas, siempre que el acorde siga grande.
+    if(verProximos && beatTimes.length){
+      const porFila = angosto ? 2 : 4;
+      const escP = proximosEscala(anchoDisp, porFila);
+      const filaPx = ALTO_FILA_PROXIMOS * escP;
+      const sobra = altoDisp - altoBase * escalaVisual - MARGEN_PROXIMOS;
+      if(sobra >= filaPx){
+        filasProximos = Math.min(8, Math.floor(sobra / filaPx));
+      } else {
+        for(const filas of [2, 1]){
+          const con = escalaCon(altoDisp - filas * filaPx - MARGEN_PROXIMOS);
+          if(con >= Math.min(1.25, escalaVisual)){ escalaVisual = con; filasProximos = filas; break; }
+        }
+      }
+    }
   }
+  configurarProximos(filasProximos, proximosEscala(anchoDisp, angosto ? 2 : 4));
   document.documentElement.style.setProperty("--esc", escalaVisual.toFixed(3));
   // los diagramas son SVG con tamaño quemado al generarlos: hay que redibujar
   ultimoAcorde = null; ultimoSiguiente = null;
@@ -12055,9 +13328,13 @@ btnModoTocar.addEventListener("click", () => {
   const destino = document.getElementById("columna-pistas-cuerpo");
   const cajonCuerpo = document.querySelector("#cajon-ajustes .cajon-cuerpo");
   if(!panel || !destino || !cajonCuerpo) return;
-  const ancho = window.matchMedia("(min-width: 1000px)");
-  let oculto = false;
-  try{ oculto = localStorage.getItem("mesaPistasOcultas") === "1"; }catch(e){}
+  // v115: solo en pantallas anchas Y apaisadas. En la tablet vertical la columna
+  // le comía un tercio del ancho al cartel y dejaba media pantalla vacía abajo.
+  const ancho = window.matchMedia("(min-width: 1000px) and (min-aspect-ratio: 1/1)");
+  // v115: arrancan ocultas (la mezcla se ajusta una vez por tema y los mute
+  // rápidos quedan en la barra de abajo); se recuerda si las mostrás.
+  let oculto = true;
+  try{ oculto = localStorage.getItem("mesaPistasOcultas") !== "0"; }catch(e){}
   function ubicar(){
     const alLado = ancho.matches && !oculto;
     document.body.classList.toggle("pistas-al-lado", alLado);
@@ -12083,7 +13360,7 @@ btnModoTocar.addEventListener("click", () => {
   if(window.ResizeObserver) new ResizeObserver(ajustarAlto).observe(document.getElementById("panel-transporte"));
   function fijarOculto(si){
     oculto = si;
-    try{ if(si) localStorage.setItem("mesaPistasOcultas", "1"); else localStorage.removeItem("mesaPistasOcultas"); }catch(e){}
+    try{ localStorage.setItem("mesaPistasOcultas", si ? "1" : "0"); }catch(e){}
     ubicar();
   }
   document.getElementById("ocultar-pistas").addEventListener("click", () => fijarOculto(true));
