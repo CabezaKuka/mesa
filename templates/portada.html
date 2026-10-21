@@ -1,0 +1,874 @@
+
+<!-- Pantalla de inicio: se ve una sola vez por sesión (al abrir la app), no cada vez que se
+     vuelve a la portada. Un toque la cierra antes. Es solo presentación: no bloquea la carga. -->
+<style>
+  #splash{
+    position:fixed; inset:0; z-index:10000; background:var(--bg);
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px;
+    transition:opacity .45s ease; cursor:pointer; -webkit-tap-highlight-color:transparent;
+  }
+  #splash.fuera{ opacity:0; pointer-events:none; }
+  #splash .splash-logo{
+    width:84px; height:84px; padding:18px; border-radius:24px; color:var(--brass);
+    background:var(--panel); border:1px solid var(--linea-fuerte);
+    animation:splash-entra .6s cubic-bezier(.2,.8,.2,1) both;
+  }
+  #splash .splash-logo svg{ width:100%; height:100%; display:block; }
+  #splash .splash-nombre{
+    font-family:var(--sans); font-size:38px; font-weight:700; letter-spacing:-.02em; color:var(--fg);
+    animation:splash-entra .6s .08s cubic-bezier(.2,.8,.2,1) both;
+  }
+  #splash .splash-sub{
+    font-family:var(--sans); font-size:14px; color:var(--fg-dim); margin-top:-8px;
+    animation:splash-entra .6s .14s cubic-bezier(.2,.8,.2,1) both;
+  }
+  #splash .splash-version{
+    position:absolute; bottom:28px; font-family:var(--mono); font-size:12px;
+    letter-spacing:.06em; color:var(--fg-tenue);
+  }
+  #splash .splash-barra{
+    width:120px; height:3px; border-radius:2px; background:var(--panel-2); overflow:hidden; margin-top:10px;
+  }
+  #splash .splash-barra::after{
+    content:""; display:block; height:100%; width:40%; border-radius:2px; background:var(--brass);
+    animation:splash-carga 1.1s ease-in-out infinite;
+  }
+  @keyframes splash-entra{ from{ opacity:0; transform:translateY(8px) scale(.97); } to{ opacity:1; transform:none; } }
+  @keyframes splash-carga{ from{ transform:translateX(-100%); } to{ transform:translateX(250%); } }
+  @media (prefers-reduced-motion: reduce){
+    #splash, #splash *{ animation:none !important; transition:none !important; }
+  }
+</style>
+<div id="splash" role="presentation" aria-hidden="true">
+  <div class="splash-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 20V10M12 20V4M18 20v-7"/><path d="M4 10h4M10 7h4M16 13h4"/></svg></div>
+  <div class="splash-nombre">Mesa</div>
+  <div class="splash-sub">separador de pistas</div>
+  <div class="splash-barra"></div>
+  {% if version_app %}<div class="splash-version">versión {{ version_app }}</div>{% endif %}
+</div>
+<script>
+(function(){
+  var splash = document.getElementById("splash");
+  var visto = false;
+  try { visto = sessionStorage.getItem("mesa-splash") === "1"; } catch(e) {}
+  if (visto) { splash.remove(); return; }
+  try { sessionStorage.setItem("mesa-splash", "1"); } catch(e) {}
+  var cerrado = false;
+  function cerrar(){
+    if (cerrado) return; cerrado = true;
+    splash.classList.add("fuera");
+    setTimeout(function(){ splash.remove(); }, 500);
+  }
+  splash.addEventListener("click", cerrar);
+  setTimeout(cerrar, 1600);
+})();
+</script>
+<!-- v107: barra lateral de secciones (solo en pantallas anchas) -->
+<nav class="riel" aria-label="Secciones">
+  <span class="riel-logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 20V10M12 20V4M18 20v-7"/><path d="M4 10h4M10 7h4M16 13h4"/></svg></span>
+  <a href="#sec-todas" class="riel-item activo"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/></svg>Biblioteca</a>
+  <a href="#sec-setlists" class="riel-item"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h1M4 12h1M4 18h1"/></svg>Setlists</a>
+  {% if jobs %}<a href="#sec-proceso" class="riel-item"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg>En proceso</a>{% endif %}
+  <span class="riel-espacio"></span>
+  <button type="button" class="riel-item" data-abrir-ajustes aria-controls="cajon-ajustes"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg>Ajustes</button>
+</nav>
+<div class="cabecera-portada">
+  <h1><span class="marca-app"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 20V10M12 20V4M18 20v-7"/><path d="M4 10h4M10 7h4M16 13h4"/></svg></span>Mesa <span>&middot; separador de pistas</span></h1>
+  <span id="ancla-red"></span>
+  <button type="button" class="boton-chico boton-icono solo-angosto" data-abrir-ajustes aria-controls="cajon-ajustes" title="Ajustes generales" aria-label="Ajustes generales"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg></button>
+  <button id="toggle-carga" type="button" class="boton-chico boton-icono con-texto" aria-controls="panel-carga" aria-expanded="{{ 'false' if canciones else 'true' }}" title="Subir un mp3 o bajar un video de YouTube"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span class="solo-ancho">Agregar canción</span></button>
+</div>
+
+<div id="panel-carga" class="panel panel-carga{{ '' if canciones else ' abierta' }}">
+  <form action="{{ url_for('subir') }}" method="post" enctype="multipart/form-data" class="fila-carga">
+    <svg width="26" height="26" viewBox="0 0 26 26" xmlns="http://www.w3.org/2000/svg" class="fila-carga-icono" aria-hidden="true">
+      <path d="M13 4 V17 M7.5 10 L13 4.5 L18.5 10" stroke="var(--brass)" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M5 21 H21" stroke="var(--brass)" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <span class="fila-carga-label">Subir un mp3</span>
+    <!-- v115: el selector nativo salía en el idioma del navegador ("Choose File / No file
+         chosen") y desentonaba; el input sigue ahí (invisible) para el formulario -->
+    <label class="elegir-archivo">
+      <input type="file" name="mp3" id="archivo-mp3" accept="audio/mpeg,audio/mp3,.mp3" required>
+      <span class="boton-chico elegir-archivo-boton">Elegir archivo</span>
+      <span class="elegir-archivo-nombre" id="archivo-mp3-nombre">o arrastralo a la ventana</span>
+    </label>
+    <button type="submit" class="boton-primario">Separar pistas</button>
+  </form>
+
+  <form action="{{ url_for('youtube') }}" method="post" class="fila-carga fila-carga-youtube">
+    <svg width="26" height="26" viewBox="0 0 26 26" xmlns="http://www.w3.org/2000/svg" class="fila-carga-icono" aria-hidden="true">
+      <rect x="2" y="5" width="22" height="16" rx="5" fill="var(--fg)"/>
+      <path d="M11 9.5 L17 13 L11 16.5 Z" fill="var(--bg)"/>
+    </svg>
+    <input type="url" name="url" class="campo-youtube" placeholder="…o pegá el link de un video de YouTube" required>
+    <button type="submit" class="boton-youtube">Descargar y separar</button>
+  </form>
+</div>
+
+{% if jobs %}
+<div class="lista" id="sec-proceso">
+  <h2>En proceso</h2>
+  <div class="jobs-fila">
+    {% for j in jobs %}
+      <a class="job-chip" href="{{ url_for('procesando', job_id=j.id) }}" title="Volver a la pantalla de este trabajo">
+        <span class="punto"></span>
+        {{ j.song or 'YouTube' }}
+        <span class="estado">{% if j.status == 'descargando' %}bajando{% elif j.status == 'en_cola' %}en cola{% else %}Demucs{% endif %} · {{ j.elapsed }}s</span>
+      </a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="lista" id="sec-setlists">
+  <h2>Setlists</h2>
+  <div class="setlists-fila">
+    {% for sid, sl in setlists.items() %}
+      <a class="setlist-chip" href="{{ url_for('ver_setlist', setlist_id=sid) }}">
+        {{ sl.nombre }} <span class="cant">{{ sl.canciones|length }}</span>
+      </a>
+    {% endfor %}
+    <!-- v115: el campo ocupaba lo más visible de la portada aunque se usa poco: queda
+         detrás de un botón que lo despliega -->
+    <button type="button" id="nuevo-setlist" class="setlist-chip setlist-nuevo" aria-controls="form-setlist" aria-expanded="false">+ Nuevo setlist</button>
+    <form class="setlist-crear" id="form-setlist" action="{{ url_for('crear_setlist') }}" method="post" hidden>
+      <input type="text" name="nombre" placeholder="Nombre del setlist" maxlength="80" required>
+      <button type="submit">Crear</button>
+    </form>
+    {% if not setlists %}<span class="setlists-vacio">Agrupá temas para un ensayo o un show: pasan solos de uno al siguiente.</span>{% endif %}
+  </div>
+</div>
+
+{% if recientes %}
+<div class="lista">
+  <h2>Últimas que abriste</h2>
+  <div class="grid-canciones grid-canciones-recientes">
+    {% for c in recientes %}
+      <div class="cancion-fila" data-song="{{ c }}" style="--borde: {{ colores[c] }};">
+        <a class="cancion" href="{{ url_for('mesa', song=c) }}" data-ini="{{ iniciales[c] }}">
+          <span class="cancion-nombre" title="{{ datos[c].titulo }}">{{ datos[c].titulo }}</span>
+          <span class="cancion-autor{{ ' sin-autor' if datos[c].autor == '----------' else '' }}" title="{{ datos[c].autor }}">{{ datos[c].autor }}</span>
+        </a>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="lista" id="sec-todas">
+  {% if canciones %}
+    <div class="lista-cabecera">
+      <h2>Todas las canciones <span style="color:var(--fg-tenue); font-weight:400;">{{ canciones|length }}</span></h2>
+      <button id="descargar-todas" type="button" class="boton-chico" title="Guardar todas las canciones en este dispositivo para tocar sin wifi, y actualizar las que ya estaban">Descargar todas</button>
+      <select id="orden-canciones" class="orden-canciones" title="Ordenar la lista" aria-label="Ordenar la lista">
+        <option value="titulo">Título A–Z</option>
+        <option value="autor">Autor A–Z</option>
+        <option value="archivo">Nombre de archivo</option>
+      </select>
+      <input type="text" id="buscar-cancion" class="buscador" placeholder="Buscar…" autocomplete="off">
+    </div>
+    <div class="grid-canciones" id="grid-todas">
+      {% for c in canciones %}
+        <div class="cancion-fila" data-song="{{ c }}" style="--borde: {{ colores[c] }};"
+             data-buscar="{{ (datos[c].titulo ~ ' ' ~ datos[c].autor)|lower }}"
+             data-titulo="{{ datos[c].titulo }}" data-autor="{{ '' if datos[c].autor == '----------' else datos[c].autor }}">
+          <a class="cancion" href="{{ url_for('mesa', song=c) }}" data-ini="{{ iniciales[c] }}">
+            <span class="cancion-nombre" title="{{ datos[c].titulo }}">{{ datos[c].titulo }}</span>
+            <span class="cancion-autor{{ ' sin-autor' if datos[c].autor == '----------' else '' }}" title="{{ datos[c].autor }}">{{ datos[c].autor }}</span>
+            {% set i = info[c] %}
+            <span class="cancion-datos">
+              {% if i.tonalidad %}<span class="dato-tono" title="Tonalidad estimada por los acordes: {{ i.tonalidad_larga }}">{{ i.tonalidad }}</span>{% endif %}
+              {% if i.bpm %}<span class="dato-bpm">{{ i.bpm }}<small> BPM</small></span>{% endif %}
+              {% if i.origen == 'midi' %}<span class="dato-origen midi" title="Acordes importados de un MIDI">MIDI</span>
+              {% elif i.dudosos %}<span class="dato-origen dudoso" title="{{ i.dudosos }} compases donde el detector dudó: revisalos en el editor">{{ i.dudosos }}?</span>{% endif %}
+            </span>
+          </a>
+          <div class="cancion-acciones">
+            <button class="renombrar-cancion" data-song="{{ c }}" data-titulo="{{ datos[c].titulo if datos[c].titulo != c else '' }}" data-autor="{{ '' if datos[c].autor == '----------' else datos[c].autor }}" title="Cambiar el título/autor que se muestran (no toca el archivo)" aria-label="Renombrar"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="M14 8l3 3"/></svg></button>
+            <button class="borrar-cancion" data-song="{{ c }}" title="Borrar esta canción y sus pistas separadas" aria-label="Borrar">&#128465;</button>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+    <p id="sin-resultados" class="vacio" style="display:none; margin-top:12px;">
+      Ninguna canción coincide con la búsqueda.
+    </p>
+  {% else %}
+    <h2>Todas las canciones</h2>
+    <p class="vacio">
+      Todavía no hay ninguna canción.<br>
+      Subí un mp3 o pegá un link de YouTube ahí arriba y Mesa separa las pistas sola.
+    </p>
+  {% endif %}
+</div>
+
+<p id="resumen-offline" class="resumen-offline" style="display:none;"></p>
+
+<!-- v107: Ajustes generales también desde la portada (el mismo panel que en
+     cada tema). Los cambios se guardan en el servidor igual que allá. -->
+<div id="cajon-fondo" class="cajon-fondo"></div>
+<aside id="cajon-ajustes" class="cajon cajon-portada" aria-label="Ajustes generales" aria-hidden="true">
+  <div class="cajon-cabecera">
+    <span class="cajon-titulo">Ajustes generales</span>
+    <button id="cerrar-ajustes" type="button" class="boton-chico boton-icono" title="Cerrar (Esc)" aria-label="Cerrar"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+  <div class="cajon-cuerpo">
+{% include "panel_generales.html" %}
+  </div>
+</aside>
+<style>
+  .cajon-portada #panel-generales .panel-plegable-cabecera{ display:none; }
+  .cajon-portada #panel-generales .panel-plegable-cuerpo{ display:grid !important; padding-top:18px; }
+</style>
+<script>
+// v107: Ajustes generales desde la portada. Mismos controles y mismas
+// preferencias que en la mesa; acá solo se guardan (no hay cartel que
+// redibujar). Las gafas se manejan igual que allá, salvo "Conectar acá".
+(function(){
+  const cajon = document.getElementById("cajon-ajustes");
+  const fondo = document.getElementById("cajon-fondo");
+  if(!cajon || !fondo) return;
+  function abrir(si){
+    document.body.classList.toggle("cajon-abierto", si);
+    cajon.setAttribute("aria-hidden", si ? "false" : "true");
+    if(si) sondearBle();
+  }
+  document.querySelectorAll("[data-abrir-ajustes]").forEach(b => b.addEventListener("click", () => abrir(true)));
+  document.getElementById("cerrar-ajustes").addEventListener("click", () => abrir(false));
+  fondo.addEventListener("click", () => abrir(false));
+  document.addEventListener("keydown", (e) => {
+    if(e.key === "Escape" && document.body.classList.contains("cajon-abierto")) abrir(false);
+  });
+
+  function pref(clave, valor){
+    return fetch("/preferencia", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clave, valor }),
+    }).then(r => r.json().catch(() => ({}))).catch(() => ({}));
+  }
+  function interruptor(id, clave, alCambiar){
+    const b = document.getElementById(id);
+    if(!b) return;
+    b.addEventListener("click", () => {
+      const v = !b.classList.contains("destacado");
+      b.classList.toggle("destacado", v);
+      pref(clave, v);
+      if(alCambiar) alCambiar(v);
+    });
+  }
+
+  // gafas: chips de estado
+  const chipHud = document.getElementById("chip-hud-estado");
+  function pintarHud(v){
+    if(!chipHud) return;
+    chipHud.classList.toggle("transmitiendo", v);
+    chipHud.querySelector(".texto").textContent = v ? "transmitiendo" : "sin transmitir";
+  }
+  const btnHud = document.getElementById("toggle-hud");
+  pintarHud(!!(btnHud && btnHud.classList.contains("destacado")));
+  const btnBle = document.getElementById("toggle-hud-ble");
+  const chipBle = document.getElementById("chip-hud-ble");
+  function pintarBle(d){
+    if(!chipBle) return;
+    const conectado = !!(d && d.conectado);
+    chipBle.classList.toggle("enlazado", conectado);
+    chipBle.classList.toggle("buscando", !!(d && d.activo && !conectado));
+    chipBle.querySelector(".texto").textContent =
+      (!d || !d.activo) ? "bluetooth apagado" : (d.detalle || (conectado ? "conectado" : "buscando…"));
+  }
+  async function sondearBle(){
+    if(!btnBle || !btnBle.classList.contains("destacado")){ pintarBle({ activo: false }); return; }
+    try{
+      const r = await fetch("/hud/estado", { cache: "no-store" });
+      pintarBle(await r.json());
+    }catch(e){ /* sin conexión: el chip de red ya lo dice */ }
+  }
+  setInterval(() => {
+    if(!document.hidden && document.body.classList.contains("cajon-abierto")) sondearBle();
+  }, 3000);
+  sondearBle();
+
+  interruptor("toggle-diagramas", "mostrar_diagramas");
+  interruptor("toggle-grados", "mostrar_grados");
+  interruptor("toggle-color-duracion", "colorear_duracion");
+  interruptor("toggle-hud", "hud_activo", pintarHud);
+  interruptor("toggle-hud-ble", "hud_ble", () => { pintarBle({ activo: btnBle.classList.contains("destacado"), detalle: null }); setTimeout(sondearBle, 600); });
+  interruptor("toggle-hud-invertido", "hud_invertido");
+
+  // color de la barra por banda de duración
+  document.querySelectorAll(".colores-fila").forEach(fila => {
+    const banda = fila.dataset.banda;
+    fila.querySelectorAll(".swatch-color").forEach(btn => btn.addEventListener("click", () => {
+      fila.querySelectorAll(".swatch-color").forEach(x => x.classList.toggle("seleccionado", x === btn));
+      fila.style.setProperty("--sel", btn.style.getPropertyValue("--sw"));
+      pref("color_" + banda, btn.dataset.stem);
+    }));
+  });
+
+  // color de la app
+  const presets = Array.from(document.querySelectorAll(".tema-preset"));
+  const campo = document.getElementById("color-base");
+  let actual = {{ color_base|tojson }};
+  let temporizador = null;
+  function marcar(){
+    presets.forEach(b => b.classList.toggle("seleccionado", (b.dataset.color || "") === actual));
+    if(campo) campo.value = (actual && actual.charAt(0) === "#") ? actual : "#f2b33d";
+  }
+  function elegir(hex, inmediato){
+    actual = hex;
+    if(window.mesaColorBase) window.mesaColorBase(hex);
+    marcar();
+    clearTimeout(temporizador);
+    temporizador = setTimeout(() => pref("color_base", actual), inmediato ? 0 : 400);
+  }
+  presets.forEach(b => b.addEventListener("click", () => elegir(b.dataset.color || "", true)));
+  if(campo) campo.addEventListener("input", () => elegir(campo.value.toLowerCase(), false));
+  const btnOriginal = document.getElementById("color-base-original");
+  if(btnOriginal) btnOriginal.addEventListener("click", () => elegir("", true));
+  marcar();
+
+  // brillo de las gafas
+  const elBrillo = document.getElementById("hud-brillo-actual");
+  const menos = document.getElementById("hud-brillo-menos"), mas = document.getElementById("hud-brillo-mas");
+  if(elBrillo && menos && mas){
+    let nivel = parseInt(elBrillo.dataset.nivel, 10) || 3;
+    const tope = parseInt(elBrillo.dataset.max, 10) || 5;
+    const pintar = () => {
+      elBrillo.textContent = "brillo " + nivel + "/" + tope;
+      menos.disabled = nivel <= 1; mas.disabled = nivel >= tope;
+    };
+    menos.addEventListener("click", () => { if(nivel > 1){ nivel--; pintar(); pref("hud_brillo", nivel); } });
+    mas.addEventListener("click", () => { if(nivel < tope){ nivel++; pintar(); pref("hud_brillo", nivel); } });
+    pintar();
+  }
+
+  // calidad del audio: por dispositivo (cookie), igual que en la mesa
+  const grupoCal = document.querySelector("[data-calidad]");
+  if(grupoCal){
+    let cal = grupoCal.dataset.calidad || "estereo160";
+    const botones = Array.from(grupoCal.querySelectorAll(".calidad"));
+    const peso = document.getElementById("calidad-peso");
+    const pintar = () => {
+      const mono = cal.startsWith("mono"), b96 = cal.endsWith("96");
+      botones.forEach(b => {
+        if(b.dataset.canal) b.classList.toggle("marcado", (b.dataset.canal === "mono") === mono);
+        if(b.dataset.bitrate) b.classList.toggle("marcado", (b.dataset.bitrate === "96") === b96);
+      });
+      if(peso) peso.textContent = (mono ? "mono" : "estéreo") + " · " + (b96 ? "96k" : "160k");
+    };
+    botones.forEach(btn => btn.addEventListener("click", () => {
+      const mono = btn.dataset.canal ? btn.dataset.canal === "mono" : cal.startsWith("mono");
+      const b96 = btn.dataset.bitrate ? btn.dataset.bitrate === "96" : cal.endsWith("96");
+      cal = (mono ? "mono" : "estereo") + (b96 ? "96" : "160");
+      document.cookie = "mesa_calidad=" + cal + "; path=/; max-age=31536000; SameSite=Lax";
+      pintar();
+    }));
+    pintar();
+  }
+})();
+</script>
+
+<script>
+// v102: el formulario de "agregar canción" arranca cerrado si ya hay
+// canciones (la lista es lo que se usa todos los días) y se abre con el botón.
+(function(){
+  var b = document.getElementById("toggle-carga"), p = document.getElementById("panel-carga");
+  if(!b || !p) return;
+  b.addEventListener("click", function(){
+    var abierta = p.classList.toggle("abierta");
+    b.setAttribute("aria-expanded", abierta ? "true" : "false");
+    if(abierta){ var c = p.querySelector(".campo-youtube"); if(c) c.focus(); }
+  });
+})();
+
+// v115: selector de archivo propio + arrastrar y soltar un mp3 en cualquier parte de la
+// portada (se sube y se separa directo, como si lo hubieras elegido y tocado "Separar").
+(function(){
+  var input = document.getElementById("archivo-mp3");
+  var nombre = document.getElementById("archivo-mp3-nombre");
+  var panel = document.getElementById("panel-carga");
+  if(!input || !nombre) return;
+  input.addEventListener("change", function(){
+    nombre.textContent = input.files && input.files[0] ? input.files[0].name : "o arrastralo a la ventana";
+    nombre.classList.toggle("elegido", !!(input.files && input.files[0]));
+  });
+  var capa = document.createElement("div");
+  capa.id = "capa-soltar";
+  capa.innerHTML = '<div class="capa-soltar-caja">Soltá el mp3 para separarlo</div>';
+  document.body.appendChild(capa);
+  var profundidad = 0;
+  function esArchivo(e){ return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], "Files") >= 0; }
+  window.addEventListener("dragenter", function(e){ if(!esArchivo(e)) return; profundidad++; capa.classList.add("visible"); });
+  window.addEventListener("dragleave", function(e){ if(!esArchivo(e)) return; if(--profundidad <= 0){ profundidad = 0; capa.classList.remove("visible"); } });
+  window.addEventListener("dragover", function(e){ if(esArchivo(e)) e.preventDefault(); });
+  window.addEventListener("drop", function(e){
+    if(!esArchivo(e)) return;
+    e.preventDefault();
+    profundidad = 0;
+    capa.classList.remove("visible");
+    var archivo = e.dataTransfer.files[0];
+    if(!archivo) return;
+    if(!/\.mp3$/i.test(archivo.name) && archivo.type !== "audio/mpeg"){
+      mesaAviso("Por ahora Mesa separa archivos mp3: «" + archivo.name + "» no lo es.", { error: true });
+      return;
+    }
+    try{
+      var dt = new DataTransfer();
+      dt.items.add(archivo);
+      input.files = dt.files;
+    }catch(err){
+      mesaAviso("Este navegador no deja soltar archivos acá: usá «Elegir archivo».", { error: true });
+      return;
+    }
+    input.dispatchEvent(new Event("change"));
+    if(panel && !panel.classList.contains("abierta")){
+      panel.classList.add("abierta");
+      var b = document.getElementById("toggle-carga");
+      if(b) b.setAttribute("aria-expanded", "true");
+    }
+    input.form.requestSubmit ? input.form.requestSubmit() : input.form.submit();
+  });
+})();
+
+// v115: "+ Nuevo setlist" despliega el campo
+(function(){
+  var b = document.getElementById("nuevo-setlist"), f = document.getElementById("form-setlist");
+  if(!b || !f) return;
+  b.addEventListener("click", function(){
+    f.hidden = !f.hidden;
+    b.setAttribute("aria-expanded", f.hidden ? "false" : "true");
+    if(!f.hidden){ var i = f.querySelector("input"); if(i) i.focus(); }
+  });
+})();
+</script>
+<style>
+  /* v115: selector de archivo propio */
+  .elegir-archivo{ position:relative; display:flex; align-items:center; gap:10px; min-width:120px; flex:1 1 0; cursor:pointer; }
+  .elegir-archivo .elegir-archivo-boton{
+    flex:0 0 auto; padding:8px 14px; border-radius:999px; background:var(--panel-3); color:var(--fg);
+    border:1px solid var(--linea-fuerte); font-weight:600; pointer-events:none;
+  }
+  .fila-carga:has(.elegir-archivo){ flex-wrap:nowrap; }
+  @media (max-width: 600px){
+    /* en el celular no hay qué arrastrar: el nombre solo aparece al elegir, y "Separar" baja */
+    .fila-carga:has(.elegir-archivo){ flex-wrap:wrap; }
+    .elegir-archivo-nombre:not(.elegido){ display:none; }
+    .fila-carga:has(.elegir-archivo) .boton-primario{ flex:0 0 auto; }
+  }
+  .elegir-archivo input[type=file]{ position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+  .elegir-archivo:focus-within .elegir-archivo-boton{ outline:2px solid var(--brass); outline-offset:2px; }
+  .elegir-archivo-nombre{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; color:var(--fg-tenue); }
+  .elegir-archivo-nombre.elegido{ color:var(--fg); font-weight:600; }
+  #capa-soltar{
+    position:fixed; inset:0; z-index:9500; display:none; align-items:center; justify-content:center;
+    background:color-mix(in srgb, var(--bg) 70%, transparent); pointer-events:none;
+  }
+  #capa-soltar.visible{ display:flex; }
+  .capa-soltar-caja{
+    padding:28px 40px; border:2px dashed var(--brass); border-radius:24px; background:var(--panel);
+    font-size:18px; font-weight:700; color:var(--brass);
+  }
+  /* v115: setlists */
+  .setlist-crear[hidden]{ display:none !important; }
+  .setlist-nuevo{ cursor:pointer; border-style:dashed; font:inherit; }
+  .setlists-vacio{ font-size:13px; color:var(--fg-tenue); align-self:center; }
+  /* v115: datos de cada tema en la lista */
+  #grid-todas .cancion-datos{
+    grid-area:bpm; display:flex; align-items:center; gap:10px; margin-right:30px;
+    font:700 12.5px var(--mono); color:var(--fg-tenue); white-space:nowrap;
+  }
+  #grid-todas .dato-bpm small{ font-weight:500; font-size:10.5px; }
+  #grid-todas .dato-tono{ color:var(--fg-dim); min-width:2.2em; text-align:right; }
+  #grid-todas .dato-origen{ padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; }
+  #grid-todas .dato-origen.midi{ background:color-mix(in srgb, var(--ok) 18%, transparent); color:var(--ok); }
+  #grid-todas .dato-origen.dudoso{ background:color-mix(in srgb, var(--brass) 18%, transparent); color:var(--brass); }
+  /* sin autor: el título se centra solo, en vez de un "sin autor" en cada fila */
+  #grid-todas .cancion-autor.sin-autor{ display:none; }
+  #grid-todas a.cancion:has(.sin-autor){ grid-template-areas:"ini nom bpm"; }
+  @media (max-width: 600px){
+    #grid-todas .dato-tono{ display:none; }
+    #grid-todas .cancion-datos{ gap:6px; margin-right:4px; }
+  }
+</style>
+<script>
+// --- descargar / actualizar toda la biblioteca -----------------------------
+// Un toque baja lo que falta y pone al día lo que ya estaba. La distinción la
+// hace el servidor (ver urls_offline_partidas): las páginas y los datos se
+// piden SIEMPRE porque son unos KB y es lo que cambia cuando se toca la app;
+// el audio, que es lo pesado, solo si no está en el caché.
+//
+// Es una operación larga -- con la biblioteca entera por Tailscale puede ser
+// media hora -- así que el mismo botón sirve para cancelar, y la cancelación
+// se chequea entre archivo y archivo: lo ya bajado queda bajado.
+(() => {
+  const btn = document.getElementById("descargar-todas");
+  if(!btn) return;
+
+  if(!window.mesaOffline || !window.mesaOffline.soportado){
+    const porHttp = location.protocol === "http:" && !["localhost","127.0.0.1"].includes(location.hostname);
+    btn.textContent = porHttp ? "offline solo por https" : "sin offline";
+    btn.disabled = true;
+    btn.title = porHttp
+      ? "Para guardar canciones hace falta entrar por https (Tailscale). Por IP local el navegador no lo permite."
+      : "Este navegador no puede guardar canciones para tocar sin wifi";
+    return;
+  }
+
+  let plan = null, estado = "listo", cancelar = false;
+
+  function pintar(texto, clase, titulo){
+    btn.classList.remove("destacado", "confirmando");
+    if(clase) btn.classList.add(clase);
+    btn.textContent = texto;
+    if(titulo) btn.title = titulo;
+  }
+
+  function mb(bytes){ return (bytes / (1024 * 1024)).toFixed(0) + " MB"; }
+
+  async function pedirPlan(){
+    const r = await fetch("/offline/todas");
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  }
+
+  // Cuánto falta de verdad: solo cuenta el audio que no está en el caché.
+  async function calcularFaltante(p){
+    let temas = 0, bytes = 0;
+    for(const c of p.canciones){
+      if(!c.audio.length) continue;
+      if(await window.mesaOffline.disponible(c.audio)) continue;
+      temas++;
+      bytes += c.bytes || 0;
+    }
+    return { temas, bytes };
+  }
+
+  async function confirmarYArrancar(){
+    pintar("consultando…", "destacado");
+    btn.disabled = true;
+    try{
+      plan = await pedirPlan();
+    }catch(e){
+      pintar("Descargar todas", null, "No pude consultar la biblioteca: " + e.message);
+      btn.disabled = false;
+      return;
+    }
+    const falta = await calcularFaltante(plan);
+    btn.disabled = false;
+
+    const espacio = await window.mesaOffline.usoAlmacenamiento();
+    let aviso = "";
+    if(espacio && espacio.cuota){
+      const libre = espacio.cuota - espacio.usado;
+      if(falta.bytes > libre * 0.9){
+        aviso = " · OJO: puede no entrar (libre " + mb(libre) + ")";
+      }
+    }
+
+    if(falta.temas === 0){
+      // nada de audio nuevo, pero igual vale la pena refrescar las páginas
+      estado = "confirmando";
+      pintar("actualizar " + plan.canciones.length + " temas", "confirmando",
+             "El audio ya está todo. Tocá de nuevo para actualizar las pantallas y los acordes guardados");
+    } else {
+      estado = "confirmando";
+      pintar("bajar " + falta.temas + " temas (~" + mb(falta.bytes) + ")" + aviso, "confirmando",
+             "Tocá de nuevo para empezar. Va a tardar; podés cancelar en cualquier momento");
+    }
+    setTimeout(() => {
+      if(estado !== "confirmando") return;
+      estado = "listo";
+      pintar("Descargar todas", null);
+    }, 6000);
+  }
+
+  async function correr(){
+    estado = "bajando";
+    cancelar = false;
+    window.mesaHayDescargaEnCurso = true;
+    let bajados = 0, actualizados = 0, fallados = 0;
+
+    try{
+      await window.mesaOffline.descargar(plan.comunes);
+      const total = plan.canciones.length;
+
+      for(let i = 0; i < total; i++){
+        if(cancelar) break;
+        const c = plan.canciones[i];
+        const etiqueta = (i + 1) + "/" + total + " · " + c.titulo;
+
+        try{
+          // las páginas y los datos SIEMPRE: son unos KB y es lo que cambia
+          // cuando se toca la app. La primera vez de un tema sin acordes
+          // generados, /acordes dispara el análisis y puede tardar bastante.
+          pintar(etiqueta + " (datos)", "destacado");
+          await window.mesaOffline.descargar(c.paginas);
+          actualizados++;
+
+          if(c.audio.length && !(await window.mesaOffline.disponible(c.audio))){
+            await window.mesaOffline.descargar(c.audio, (hecho, cant) => {
+              btn.textContent = etiqueta + " (" + hecho + "/" + cant + ")";
+            });
+            bajados++;
+          }
+        }catch(e){
+          // un tema que falla no corta la tanda entera: se sigue y se avisa al
+          // final cuántos quedaron
+          fallados++;
+        }
+      }
+    }finally{
+      window.mesaHayDescargaEnCurso = false;
+      estado = "listo";
+      pintar("Descargar todas", null, "Guardar todas las canciones en este dispositivo y actualizar las que ya estaban");
+      if(window.marcarDescargadas) window.marcarDescargadas();
+
+      let resumen = cancelar ? "Cancelado. " : "Listo. ";
+      resumen += actualizados + " temas actualizados";
+      if(bajados) resumen += ", " + bajados + " con audio nuevo";
+      if(fallados) resumen += ". " + fallados + " fallaron (probá de nuevo)";
+      mesaAviso(resumen, { error: fallados > 0, duracion: 9000 });
+    }
+  }
+
+  btn.addEventListener("click", () => {
+    if(estado === "bajando"){
+      cancelar = true;
+      pintar("cancelando…", "destacado");
+      return;
+    }
+    if(estado === "confirmando"){ correr(); return; }
+    confirmarYArrancar();
+  });
+})();
+
+// v103: "Últimas que abriste" se rearma cada vez que se muestra la portada (al
+// abrirla, con "Volver" y con el gesto "atrás"). Junta lo que sabe la PC
+// (/recientes, que no guarda nadie en caché) con lo anotado en este dispositivo
+// (window.mesaRecientes), así se actualiza también sin conexión. La portada en
+// sí puede venir de una copia guardada; la lista ya no depende de eso.
+(function(){
+  const MAX = 5;
+  function filaReciente(r){
+    const fila = document.createElement("div");
+    fila.className = "cancion-fila";
+    fila.dataset.song = r.song;
+    if(r.color) fila.style.setProperty("--borde", r.color);
+    const a = document.createElement("a");
+    a.className = "cancion";
+    a.href = r.url;
+    a.dataset.ini = r.ini || "";   // v107: portada con las iniciales del tema
+    const nombre = document.createElement("span");
+    nombre.className = "cancion-nombre";
+    nombre.textContent = nombre.title = r.titulo;
+    const autor = document.createElement("span");
+    autor.className = "cancion-autor" + (r.autor === "----------" ? " sin-autor" : "");
+    autor.textContent = autor.title = r.autor;
+    a.appendChild(nombre); a.appendChild(autor); fila.appendChild(a);
+    return fila;
+  }
+  // título, autor, color y enlace salen de la fila de "Todas las canciones":
+  // así un tema renombrado se ve con el nombre nuevo, y uno borrado no aparece
+  function datosDeFila(song){
+    const fila = document.querySelector('#grid-todas .cancion-fila[data-song="' + CSS.escape(song) + '"]');
+    if(!fila) return null;
+    const link = fila.querySelector("a.cancion");
+    return {
+      song, url: link ? link.getAttribute("href") : "/mesa/" + encodeURIComponent(song),
+      ini: link ? (link.dataset.ini || "") : "",
+      titulo: fila.dataset.titulo || song, autor: fila.dataset.autor || "----------",
+      color: fila.style.getPropertyValue("--borde").trim(),
+    };
+  }
+  async function refrescarRecientes(){
+    const R = window.mesaRecientes;
+    if(R) await R.sincronizar();                 // lo abierto sin conexión, a la PC
+    let deLaPc = null;
+    try{
+      const r = await fetch("/recientes", { cache: "no-store" });
+      if(r.ok) deLaPc = await r.json();
+    }catch(e){ /* sin conexión: se usa lo de este dispositivo */ }
+    if(R && deLaPc) R.mezclar(deLaPc);
+    const horas = R ? R.leer() : {};
+    if(Array.isArray(deLaPc)) deLaPc.forEach(r => { if(!(horas[r.song] >= r.t)) horas[r.song] = r.t || 0; });
+    const lista = Object.keys(horas)
+      .sort((x, y) => horas[y] - horas[x])
+      .map(datosDeFila).filter(Boolean).slice(0, MAX);
+    if(!lista.length) return;
+    let grid = document.querySelector(".grid-canciones-recientes");
+    const firma = JSON.stringify(lista);
+    if(grid && grid.dataset.firma === firma) return;   // ya está al día: no se toca el DOM
+    if(!grid){
+      // primera canción abierta: la sección todavía no existía en esta página
+      const todas = document.getElementById("grid-todas");
+      const destino = todas && todas.closest(".lista");
+      if(!destino) return;
+      const seccion = document.createElement("div");
+      seccion.className = "lista";
+      const h2 = document.createElement("h2");
+      h2.textContent = "Últimas que abriste";
+      grid = document.createElement("div");
+      grid.className = "grid-canciones grid-canciones-recientes";
+      seccion.appendChild(h2); seccion.appendChild(grid);
+      destino.parentNode.insertBefore(seccion, destino);
+    }
+    grid.textContent = "";
+    lista.forEach(r => grid.appendChild(filaReciente(r)));
+    grid.dataset.firma = firma;
+    if(window.marcarDescargadas) window.marcarDescargadas();
+  }
+  window.addEventListener("pageshow", refrescarRecientes);
+})();
+
+// orden de la lista: se reacomodan las filas en el navegador (no toca archivos ni la
+// búsqueda). La elección se recuerda en este dispositivo; por defecto, título A-Z.
+(function(){
+  const selOrden = document.getElementById("orden-canciones");
+  const grid = document.getElementById("grid-todas");
+  if(!selOrden || !grid) return;
+  const filas = Array.from(grid.querySelectorAll(".cancion-fila"));
+  const cmp = new Intl.Collator("es", {sensitivity: "base", numeric: true});
+  // "The Beatles" / "Los Enanitos" se ordenan igual; solo se ignoran signos al principio
+  const limpio = t => (t || "").replace(/^[^0-9A-Za-zÀ-ÿ]+/, "");
+  function ordenar(modo){
+    const orden = filas.slice().sort((a, b) => {
+      if(modo === "archivo") return cmp.compare(a.dataset.song, b.dataset.song);
+      if(modo === "autor"){
+        const aa = a.dataset.autor, bb = b.dataset.autor;
+        if(!aa !== !bb) return aa ? -1 : 1;   // sin autor, al final
+        const r = cmp.compare(limpio(aa), limpio(bb));
+        if(r) return r;
+      }
+      return cmp.compare(limpio(a.dataset.titulo), limpio(b.dataset.titulo)) || cmp.compare(a.dataset.song, b.dataset.song);
+    });
+    orden.forEach(f => grid.appendChild(f));
+  }
+  let modo = "titulo";
+  try { modo = localStorage.getItem("mesa-orden-canciones") || "titulo"; } catch(e) {}
+  if(!["titulo", "autor", "archivo"].includes(modo)) modo = "titulo";
+  selOrden.value = modo;
+  ordenar(modo);
+  selOrden.addEventListener("change", () => {
+    ordenar(selOrden.value);
+    try { localStorage.setItem("mesa-orden-canciones", selOrden.value); } catch(e) {}
+  });
+})();
+
+// filtro en vivo de la lista de canciones: nada de servidor, solo esconder
+// filas -- con la biblioteca grande es la diferencia entre buscar y scrollear
+const campoBuscar = document.getElementById("buscar-cancion");
+if(campoBuscar){
+  const filas = Array.from(document.querySelectorAll("#grid-todas .cancion-fila"));
+  const sinResultados = document.getElementById("sin-resultados");
+  campoBuscar.addEventListener("input", () => {
+    const q = campoBuscar.value.trim().toLowerCase();
+    let visibles = 0;
+    filas.forEach(f => {
+      const ok = !q || (f.dataset.buscar || "").includes(q);
+      f.style.display = ok ? "" : "none";
+      if(ok) visibles++;
+    });
+    sinResultados.style.display = visibles ? "none" : "block";
+  });
+}
+
+document.querySelectorAll(".renombrar-cancion").forEach(btn => {
+  btn.addEventListener("click", (e) => {
+    const fila = e.currentTarget.closest(".cancion-fila");
+    if(fila.querySelector(".cancion-editar")) return; // ya se está editando
+    const link = fila.querySelector(".cancion");
+    const song = e.currentTarget.dataset.song;
+    const tituloActual = e.currentTarget.dataset.titulo || "";
+    const autorActual = e.currentTarget.dataset.autor || "";
+
+    const editar = document.createElement("div");
+    editar.className = "cancion cancion-editar";
+    editar.innerHTML = `
+      <input type="text" class="campo-renombrar campo-titulo" maxlength="120"
+             placeholder="Título (vacío = nombre del archivo)">
+      <input type="text" class="campo-renombrar campo-autor" maxlength="120"
+             placeholder="Autor / banda (opcional)">
+      <div class="cancion-editar-botones">
+        <button type="button" class="boton-chico guardar-nombre">Guardar</button>
+        <button type="button" class="boton-chico cancelar-nombre">Cancelar</button>
+      </div>
+    `;
+    link.style.display = "none";
+    fila.insertBefore(editar, link);
+    const inputTitulo = editar.querySelector(".campo-titulo");
+    const inputAutor = editar.querySelector(".campo-autor");
+    inputTitulo.value = tituloActual;
+    inputAutor.value = autorActual;
+    inputTitulo.focus();
+    inputTitulo.select();
+
+    function cerrar(){
+      editar.remove();
+      link.style.display = "";
+    }
+    async function guardar(){
+      try{
+        const r = await fetch(`/alias/${encodeURIComponent(song)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ titulo: inputTitulo.value.trim(), autor: inputAutor.value.trim() }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if(!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        // recarga entera: más simple que actualizar a mano la tarjeta en
+        // "Recientes" y en "Todas" por separado
+        location.reload();
+      }catch(err){
+        mesaAviso("No se pudo renombrar: " + err.message, { error: true });
+      }
+    }
+    editar.querySelector(".guardar-nombre").addEventListener("click", guardar);
+    editar.querySelector(".cancelar-nombre").addEventListener("click", cerrar);
+    [inputTitulo, inputAutor].forEach(campo => campo.addEventListener("keydown", (ev) => {
+      if(ev.key === "Enter"){ ev.preventDefault(); guardar(); }
+      if(ev.key === "Escape"){ ev.preventDefault(); cerrar(); }
+    }));
+  });
+});
+
+document.querySelectorAll(".borrar-cancion").forEach(btn => {
+  btn.addEventListener("click", async (e) => {
+    const b = e.currentTarget;
+    const song = b.dataset.song;
+    // doble confirmación en el propio botón (window.confirm no anda bien en la
+    // ventana embebida): primer click avisa, segundo dentro de 4s borra
+    if(b.dataset.confirmando !== "1"){
+      b.dataset.confirmando = "1";
+      b.classList.add("confirmando");
+      b.textContent = "¿borrar?";
+      b.title = "Se borran las pistas separadas y los acordes corregidos. Tocá de nuevo para confirmar.";
+      setTimeout(() => {
+        if(b.dataset.confirmando !== "1") return;
+        delete b.dataset.confirmando;
+        b.classList.remove("confirmando");
+        b.innerHTML = "&#128465;";
+      }, 4000);
+      return;
+    }
+    delete b.dataset.confirmando;
+    b.disabled = true;
+    b.textContent = "…";
+    try{
+      const r = await fetch(`/borrar/${encodeURIComponent(song)}`, { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if(!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      await window.mesaOffline.borrarPorCancion(song);
+      // recarga entera (no solo saca la fila) para que la sección "Recientes"
+      // no quede mostrando una canción que ya no existe
+      location.reload();
+    }catch(err){
+      mesaAviso("No se pudo borrar: " + err.message, { error: true });
+      b.disabled = false;
+      b.classList.remove("confirmando");
+      b.innerHTML = "&#128465;";
+    }
+  });
+});
+</script>

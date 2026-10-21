@@ -1,0 +1,296 @@
+
+<style>
+  .setlist-header{
+    width:100%; max-width:1080px; display:flex; align-items:center; gap:10px; margin-bottom:16px;
+  }
+  .setlist-header h1{ flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .setlist-fila-cancion{
+    display:flex; align-items:center; gap:12px;
+    background:var(--panel-2); border:1px solid transparent; border-radius:var(--r-m);
+    padding:8px 8px 8px 14px; margin-bottom:6px;
+    transition:background .14s;
+  }
+  .setlist-fila-cancion:hover{ background:var(--panel-3); }
+  .setlist-pos{
+    flex:0 0 auto; width:26px; height:26px; line-height:26px; text-align:center; font-family:var(--mono);
+    color:var(--fg-dim); font-size:12px; background:var(--panel); border-radius:50%;
+  }
+  .setlist-fila-cancion .cancion{
+    flex:1; min-width:0; display:flex; flex-direction:row; align-items:baseline; justify-content:flex-start; gap:10px;
+    background:transparent; border:none; border-radius:0; padding:6px 0;
+    text-decoration:none; color:var(--fg);
+  }
+  .setlist-fila-cancion .cancion::before{ display:none; }
+  .setlist-fila-cancion .cancion:hover{ background:transparent; }
+  .setlist-fila-cancion .cancion-nombre{
+    -webkit-line-clamp:1; min-height:0; font-size:14px; font-weight:600;
+  }
+  .setlist-fila-cancion .cancion-autor{ white-space:nowrap; }
+  .setlist-fila-acciones{ flex:0 0 auto; display:flex; gap:4px; }
+  .setlist-fila-acciones button{
+    background:transparent; color:var(--fg-tenue); border:1px solid transparent;
+    border-radius:8px; padding:0; width:34px; height:34px; font-size:11px;
+    display:inline-flex; align-items:center; justify-content:center;
+  }
+  .setlist-fila-acciones button svg{ width:16px; height:16px; }
+  .setlist-fila-acciones button:hover{ color:var(--brass); background:var(--panel); }
+  .setlist-fila-acciones .quitar-setlist:hover{ color:var(--led-mute); }
+  .setlist-empezar{ display:flex; justify-content:center; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:20px; }
+  .setlist-empezar .boton-primario{ display:inline-flex; align-items:center; gap:8px; padding:11px 20px; border-radius:999px; font-size:14px; }
+  #descargar-setlist{ border-radius:999px; }
+  #descargar-setlist.descargada{ color:var(--ok); border-color:rgba(var(--tinta),.45); background:rgba(var(--tinta),.10); }
+  #descargar-setlist.trabajando{ color:var(--brass); border-color:rgba(var(--tinta),.45); background:rgba(var(--tinta),.10); cursor:progress; }
+  .setlist-agregar{
+    display:flex; gap:8px; margin-top:18px; padding-top:18px; border-top:1px solid var(--linea);
+  }
+  .setlist-agregar select{ flex:1; min-width:0; }
+</style>
+
+<div class="setlist-header">
+  <a href="{{ url_for('home') }}" class="boton-chico boton-icono con-texto" title="Volver a la portada"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg><span class="solo-ancho">Volver</span></a>
+  <h1 style="margin:0;">{{ nombre }}</h1>
+  <span id="ancla-red"></span>
+  <button id="borrar-setlist" class="boton-chico boton-icono peligro" title="Borrar este setlist (no borra las canciones)" aria-label="Borrar setlist"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M9.5 7V4.8h5V7M6.5 7l.8 11.6a1.6 1.6 0 0 0 1.6 1.4h6.2a1.6 1.6 0 0 0 1.6-1.4L17.5 7M10 11v5M14 11v5"/></svg></button>
+</div>
+
+<div class="panel">
+  {% if canciones %}
+    <div class="setlist-empezar">
+      <a id="setlist-empezar-link" href="{{ url_for('mesa', song=canciones[0]) }}?setlist={{ setlist_id }}" style="text-decoration:none;">
+        <button type="button" class="boton-primario"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.5 4.8c0-.8.9-1.3 1.6-.9l10.3 6.3c.7.4.7 1.4 0 1.8L9.1 18.4c-.7.4-1.6-.1-1.6-.9z" fill="currentColor" stroke="none"/></svg> Empezar &middot; {{ canciones|length }} canciones</button>
+      </a>
+      <!-- Baja TODOS los temas del setlist de un tirón (antes había que abrir
+           cada mesa y tocar su chip). Mismos tres estados que el chip de la
+           mesa: gris = falta algo, verde = todo bajado (tocar = borrar, con
+           confirmación), dorado = trabajando. -->
+      <button id="descargar-setlist" type="button" class="boton-chico" title="Guardar todas las canciones de este setlist para tocar sin wifi">consultando…</button>
+    </div>
+    {% for c in canciones %}
+      <div class="setlist-fila-cancion" data-song="{{ c }}">
+        <span class="setlist-pos">{{ loop.index }}</span>
+        <a class="cancion" href="{{ url_for('mesa', song=c) }}?setlist={{ setlist_id }}">
+          <span class="cancion-nombre" title="{{ datos[c].titulo }}">{{ datos[c].titulo }}</span>
+          <span class="cancion-autor{{ ' sin-autor' if datos[c].autor == '----------' else '' }}" title="{{ datos[c].autor }}">{{ datos[c].autor }}</span>
+        </a>
+        <div class="setlist-fila-acciones">
+          <button class="mover-arriba" title="Subir" aria-label="Subir" {{ 'disabled' if loop.first else '' }}><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 15l-6-6-6 6"/></svg></button>
+          <button class="mover-abajo" title="Bajar" aria-label="Bajar" {{ 'disabled' if loop.last else '' }}><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+          <button class="quitar-setlist" title="Sacar del setlist (no borra la canción)" aria-label="Sacar"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+        </div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <p class="vacio">Este setlist todavía está vacío. Elegí una canción abajo para empezar a armarlo.</p>
+  {% endif %}
+
+  {% if para_agregar %}
+    <form class="setlist-agregar" id="form-agregar">
+      <select id="select-agregar">
+        {% for c in para_agregar %}
+          <option value="{{ c }}">{{ datos_agregar[c].titulo }}{% if datos_agregar[c].autor != '----------' %} &mdash; {{ datos_agregar[c].autor }}{% endif %}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Agregar</button>
+    </form>
+  {% endif %}
+</div>
+
+<script>
+const setlistId = "{{ setlist_id }}";
+
+function ordenActual(){
+  return Array.from(document.querySelectorAll(".setlist-fila-cancion")).map(f => f.dataset.song);
+}
+
+// Después de mover una fila se recalculan en el DOM el número de posición,
+// los botones subir/bajar de los extremos y el link de "Empezar": ya no hace
+// falta recargar la página entera por cada movimiento.
+function refrescarFilas(){
+  const filas = Array.from(document.querySelectorAll(".setlist-fila-cancion"));
+  filas.forEach((f, i) => {
+    const pos = f.querySelector(".setlist-pos");
+    if(pos) pos.textContent = i + 1;
+    const arriba = f.querySelector(".mover-arriba"), abajo = f.querySelector(".mover-abajo");
+    if(arriba) arriba.disabled = (i === 0);
+    if(abajo) abajo.disabled = (i === filas.length - 1);
+  });
+  const empezar = document.getElementById("setlist-empezar-link");
+  if(empezar && filas.length) empezar.href = `/mesa/${encodeURIComponent(filas[0].dataset.song)}?setlist=${setlistId}`;
+}
+
+async function guardarOrden(){
+  try{
+    const r = await fetch(`/setlist/${setlistId}/orden`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ canciones: ordenActual() }),
+    });
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+  }catch(e){
+    mesaAviso("No se pudo guardar el orden: " + e.message, { error: true });
+  }
+}
+
+document.querySelectorAll(".mover-arriba").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const fila = btn.closest(".setlist-fila-cancion");
+    const anterior = fila.previousElementSibling;
+    if(!anterior || !anterior.classList.contains("setlist-fila-cancion")) return;
+    fila.parentNode.insertBefore(fila, anterior);
+    refrescarFilas();
+    await guardarOrden();
+  });
+});
+document.querySelectorAll(".mover-abajo").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const fila = btn.closest(".setlist-fila-cancion");
+    const siguiente = fila.nextElementSibling;
+    if(!siguiente || !siguiente.classList.contains("setlist-fila-cancion")) return;
+    fila.parentNode.insertBefore(siguiente, fila);
+    refrescarFilas();
+    await guardarOrden();
+  });
+});
+
+document.querySelectorAll(".quitar-setlist").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const song = btn.closest(".setlist-fila-cancion").dataset.song;
+    try{
+      await fetch(`/setlist/${setlistId}/quitar`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ song }),
+      });
+      location.reload();
+    }catch(err){
+      mesaAviso("No se pudo sacar la canción: " + err.message, { error: true });
+    }
+  });
+});
+
+const formAgregar = document.getElementById("form-agregar");
+if(formAgregar){
+  formAgregar.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const song = document.getElementById("select-agregar").value;
+    try{
+      await fetch(`/setlist/${setlistId}/agregar`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ song }),
+      });
+      location.reload();
+    }catch(err){
+      mesaAviso("No se pudo agregar la canción: " + err.message, { error: true });
+    }
+  });
+}
+
+const btnBorrarSetlist = document.getElementById("borrar-setlist");
+btnBorrarSetlist.addEventListener("click", async () => {
+  if(btnBorrarSetlist.dataset.confirmando !== "1"){
+    btnBorrarSetlist.dataset.confirmando = "1";
+    btnBorrarSetlist.classList.add("confirmando");
+    btnBorrarSetlist.title = "Tocá de nuevo para confirmar (no borra las canciones, solo la lista)";
+    setTimeout(() => {
+      delete btnBorrarSetlist.dataset.confirmando;
+      btnBorrarSetlist.classList.remove("confirmando");
+    }, 4000);
+    return;
+  }
+  try{
+    await fetch(`/setlist/${setlistId}/borrar`, { method: "POST" });
+    window.location = "{{ url_for('home') }}";
+  }catch(err){
+    mesaAviso("No se pudo borrar el setlist: " + err.message, { error: true });
+  }
+});
+
+// --- descargar el setlist completo para tocar sin wifi ----------------------
+(() => {
+  const btn = document.getElementById("descargar-setlist");
+  if(!btn) return;
+  if(!window.mesaOffline || !window.mesaOffline.soportado){
+    const porHttp = location.protocol === "http:" && !["localhost","127.0.0.1"].includes(location.hostname);
+    btn.textContent = porHttp ? "offline solo por https" : "sin offline";
+    btn.disabled = true;
+    return;
+  }
+  const calidadActual = "{{ calidad_actual }}";
+  let plan = null, todoBajado = false, confirmando = false, ocupado = false, temporizador = null;
+
+  function pintar(clase, texto, titulo){
+    btn.classList.remove("descargada", "trabajando", "confirmando");
+    if(clase) btn.classList.add(clase);
+    btn.textContent = texto;
+    if(titulo) btn.title = titulo;
+  }
+
+  async function cargarPlan(){
+    const r = await fetch(`/setlist/${setlistId}/offline`);
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    return d;
+  }
+
+  async function refrescarEstado(){
+    clearTimeout(temporizador); confirmando = false;
+    try{ plan = await cargarPlan(); }
+    catch(e){ pintar(null, "descargar setlist", "No pude consultar el setlist: " + e.message); btn.disabled = false; return; }
+    let faltan = 0, bytes = 0;
+    for(const c of plan.canciones){
+      if(await window.mesaOffline.disponible(c.urls)) bytes += await window.mesaOffline.tamanoBytes(c.urls);
+      else faltan++;
+    }
+    todoBajado = plan.canciones.length > 0 && faltan === 0;
+    if(todoBajado){
+      pintar("descargada", `todo sin wifi · ${window.mesaOffline.fmtMB(bytes)}`, "Las " + plan.canciones.length + " canciones están guardadas. Tocá para borrar las descargas de este setlist");
+    } else {
+      pintar(null, faltan === plan.canciones.length ? "descargar setlist" : `descargar setlist (faltan ${faltan})`,
+             "Guarda todas las canciones de este setlist para tocar sin wifi");
+    }
+    btn.disabled = false;
+    if(window.marcarDescargadas) window.marcarDescargadas();
+  }
+
+  btn.addEventListener("click", async () => {
+    if(ocupado || !plan) return;
+    if(todoBajado && !confirmando){
+      confirmando = true;
+      pintar("confirmando", "¿borrar descargas?", "Tocá otra vez para borrar las descargas de todas las canciones del setlist");
+      temporizador = setTimeout(refrescarEstado, 4000);
+      return;
+    }
+    ocupado = true; btn.disabled = true;
+    try{
+      if(confirmando){
+        confirmando = false;
+        pintar("trabajando", "borrando…");
+        for(const c of plan.canciones) await window.mesaOffline.borrarPorCancion(c.song);
+      } else {
+        window.mesaHayDescargaEnCurso = true;
+        const total = plan.canciones.length;
+        // primero las páginas comunes (portada y este setlist)
+        await window.mesaOffline.descargar(plan.paginas);
+        for(let i = 0; i < total; i++){
+          const c = plan.canciones[i];
+          if(await window.mesaOffline.disponible(c.urls)) continue;   // ya estaba
+          pintar("trabajando", `${i + 1}/${total} · ${c.titulo}`);
+          await window.mesaOffline.descargar(c.urls, (hecho, cant) => {
+            btn.textContent = `${i + 1}/${total} · ${c.titulo} (${hecho}/${cant})`;
+          });
+          try{ localStorage.setItem(`mesaCalidad:${c.song}`, calidadActual); }catch(e){}
+        }
+      }
+    }catch(err){
+      mesaAviso("No se pudo completar la descarga del setlist: " + err.message, { error: true });
+    }finally{
+      ocupado = false;
+      window.mesaHayDescargaEnCurso = false;
+      await refrescarEstado();
+    }
+  });
+
+  refrescarEstado();
+})();
+</script>

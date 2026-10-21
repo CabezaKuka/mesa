@@ -1,0 +1,314 @@
+<div class="panel panel-plegable{{ ' colapsado' if generales_colapsado else '' }}" id="panel-generales">
+  <div class="panel-plegable-cabecera" id="toggle-panel-generales">
+    <span class="panel-plegable-titulo">Ajustes generales</span>
+    <span class="panel-plegable-resumen">valen para todas las canciones</span>
+    <span class="panel-plegable-flecha"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></span>
+  </div>
+  <div class="panel-plegable-cuerpo panel-generales-cuerpo">
+
+    <div class="grupo">
+      <div class="grupo-titulo">Cartel de acordes</div>
+      <div class="grupo-cuerpo tiles">
+        <button id="toggle-diagramas" class="boton-chico tile{{ ' destacado' if mostrar_diagramas else '' }}" title="Mostrar u ocultar los diagramas del mástil"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="1.5"/><path d="M5 8h14M5 13h14M9.7 3v18M14.3 3v18"/><circle cx="12" cy="10.5" r="1.4" fill="currentColor"/></svg><span>Diagramas</span></button>
+        <button id="toggle-grados" class="boton-chico tile{{ ' destacado' if mostrar_grados else '' }}" title="Mostrar u ocultar los grados (números romanos) de los acordes"><span class="tile-romano" aria-hidden="true">IV</span><span>Grados</span></button>
+      </div>
+    </div>
+
+    <!-- v109: detector de acordes aprendido (ver modelo_acordes en el backend) -->
+    <div class="grupo grupo-ancho">
+      <div class="grupo-titulo">Detector de acordes</div>
+      <div class="grupo-cuerpo">
+        <button id="toggle-detector-aprendido" class="boton-chico interruptor{{ ' destacado' if (detector_aprendido and modelo_info) else '' }}"{{ '' if modelo_info else ' disabled' }} title="Usar el detector entrenado con tus MIDI en vez del de plantillas"><span class="interruptor-pista"></span>Detector aprendido</button>
+        <span id="detector-nota" class="grupo-nota">{% if modelo_info %}Entrenado con {{ modelo_info.temas }} temas{{ ' el ' ~ modelo_info.fecha if modelo_info.fecha else '' }}.{% else %}Todavía no hay modelo entrenado: se usa el detector por plantillas.{% endif %} Vale para los temas que se analicen de ahora en más (o al tocar Regenerar): no cambia los acordes ya guardados ni los importados de un MIDI.</span>
+        <div class="grupo-fila">
+          <button id="entrenar-detector" type="button" class="boton-chico" title="Aprende de los temas que tienen un MIDI importado (Chordify). Corre en la PC; podés seguir usando Mesa.">Entrenar con mis MIDI</button>
+        </div>
+        <span id="detector-estado" class="grupo-nota"></span>
+        <!-- v115: variantes del detector por plantillas, medidas contra los MIDI propios -->
+        <details class="detector-variantes" id="detector-variantes">
+          <summary>Mejoras experimentales del detector por plantillas</summary>
+          <span class="grupo-nota">Arrancan apagadas. «Medir» las prueba con todos los temas que tienen un MIDI importado y muestra cuánto coincide cada una; prendé las que ganan. Valen para los temas que se analicen de ahora en más (o al tocar Regenerar). Con el detector aprendido prendido no se usan: ahí el entrenamiento elige solo si decide por tiempos.</span>
+          <div class="grupo-fila">
+            <button id="medir-variantes" type="button" class="boton-chico" title="Corre en la PC; podés seguir usando Mesa.">Medir con mis MIDI</button>
+          </div>
+          <span id="variantes-estado" class="grupo-nota"></span>
+          <div id="variantes-lista" class="variantes-lista"></div>
+        </details>
+      </div>
+    </div>
+    <style>
+      .detector-variantes{ margin-top:10px; border-top:1px solid var(--linea); padding-top:10px; }
+      .detector-variantes summary{ cursor:pointer; font-size:13px; font-weight:600; color:var(--fg); list-style-position:inside; }
+      .detector-variantes[open] summary{ margin-bottom:8px; }
+      .variantes-lista{ display:flex; flex-direction:column; gap:6px; margin-top:8px; }
+      .variante-fila{ display:flex; flex-wrap:wrap; align-items:center; gap:6px 12px; }
+      .variante-fila .boton-chico{ flex:0 1 auto; text-align:left; }
+      .variante-dato{ font-family:var(--mono); font-size:12px; color:var(--fg-dim); }
+      .variante-dato.gana{ color:var(--ok); }
+      .variante-dato.pierde{ color:var(--led-mute); }
+    </style>
+    <script>
+    // v110: detector aprendido. Este script viaja con el panel, así funciona igual
+    // en la portada y en la mesa.
+    (function(){
+      const btnTog = document.getElementById("toggle-detector-aprendido");
+      const btnEnt = document.getElementById("entrenar-detector");
+      const est = document.getElementById("detector-estado");
+      const nota = document.getElementById("detector-nota");
+      if(!btnEnt || !est) return;
+      if(btnTog) btnTog.addEventListener("click", () => {
+        if(btnTog.disabled) return;
+        const v = !btnTog.classList.contains("destacado");
+        btnTog.classList.toggle("destacado", v);
+        fetch("/preferencia", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clave: "detector_aprendido", valor: v }) }).catch(() => {});
+      });
+      function resumen(u){
+        if(!u) return "";
+        let t = `Último entrenamiento (${u.fecha}, ${u.temas} temas): plantillas ${u.base_triada}% → aprendido ${u.modelo_triada}%`
+          + ` · mejoran ${u.mejoran}, empeoran ${u.empeoran}.`;
+        if(u.variante) t += ` Elegido: ${u.variante}, silencio ${u.umbral_silencio ? (u.umbral_silencio * 100).toFixed(1) + "% del pico" : "lo decide el modelo"}`
+          + (typeof u.v110_triada === "number" ? ` (con la configuración anterior daba ${u.v110_triada}%).` : ".");
+        if(u.excluidos && u.excluidos.length) t += ` Quedaron afuera ${u.excluidos.length} con el MIDI probablemente desfasado: `
+          + u.excluidos.map(x => x.tema).join(", ") + ".";
+        if(u.por_tiempo) t += " Decide los cambios en los tiempos del pulso.";
+        if(!u.guardado) t += " No le ganó al de plantillas: se mantuvo el modelo anterior.";
+        return t;
+      }
+      let timer = null;
+      function pintar(d){
+        if(d.corriendo){
+          btnEnt.disabled = true;
+          const paso = d.n ? ` ${Math.min(d.i + 1, d.n)}/${d.n}` : "";
+          est.textContent = `Entrenando: ${d.etapa}${paso}…` + (d.detalle ? ` (${d.detalle})` : "");
+          return;
+        }
+        btnEnt.disabled = false;
+        if(d.etapa === "error" && d.error){ est.textContent = "No se pudo entrenar: " + d.error; return; }
+        est.textContent = resumen(d.ultimo);
+        if(d.modelo && btnTog){
+          btnTog.disabled = false;
+          btnTog.classList.toggle("destacado", !!d.detector_aprendido);
+          if(nota) nota.textContent = `Entrenado con ${d.modelo.temas} temas el ${d.modelo.fecha}. `
+            + "Vale para los temas que se analicen de ahora en más (o al tocar Regenerar): no cambia los acordes ya guardados ni los importados de un MIDI.";
+        }
+      }
+      async function consultar(){
+        try{
+          const r = await fetch("/detector/estado", { cache: "no-store" });
+          const d = await r.json();
+          pintar(d);
+          if(d.corriendo && !timer) timer = setInterval(consultar, 2000);
+          if(!d.corriendo && timer){ clearInterval(timer); timer = null; }
+        }catch(e){ /* sin conexión con la PC: el chip de red ya lo dice */ }
+      }
+      btnEnt.addEventListener("click", async () => {
+        btnEnt.disabled = true;
+        est.textContent = "Arrancando…";
+        try{
+          const r = await fetch("/detector/entrenar", { method: "POST" });
+          const d = await r.json().catch(() => ({}));
+          if(!r.ok && r.status !== 409) throw new Error(d.error || `HTTP ${r.status}`);
+        }catch(e){
+          est.textContent = "No se pudo arrancar: " + e.message;
+          btnEnt.disabled = false;
+          return;
+        }
+        consultar();
+      });
+      consultar();
+    })();
+
+    // v115: medir y elegir las variantes del detector por plantillas
+    (function(){
+      const lista = document.getElementById("variantes-lista");
+      const btn = document.getElementById("medir-variantes");
+      const est = document.getElementById("variantes-estado");
+      if(!lista || !btn || !est) return;
+      let elegidas = new Set();
+      let timer = null;
+      function pintar(d){
+        elegidas = new Set(d.elegidas || []);
+        const filas = {};
+        ((d.ultima && d.ultima.filas) || []).forEach(f => { filas[f.variante] = f; });
+        const base = filas.actual;
+        lista.innerHTML = "";
+        Object.entries(d.nombres || {}).forEach(([clave, nombre]) => {
+          const fila = document.createElement("div");
+          fila.className = "variante-fila";
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "boton-chico interruptor" + (elegidas.has(clave) ? " destacado" : "");
+          b.innerHTML = '<span class="interruptor-pista"></span>';
+          b.append(document.createTextNode(nombre));
+          if(clave === "transiciones" && !d.transiciones){
+            b.disabled = true;
+            b.title = "Primero tocá «Medir»: las transiciones se aprenden de tus MIDI";
+          }
+          b.addEventListener("click", () => guardar(clave, !elegidas.has(clave)));
+          const dato = document.createElement("span");
+          dato.className = "variante-dato";
+          const f = filas[clave];
+          if(f && base){
+            const dif = f.triada - base.triada;
+            dato.textContent = `${f.triada}% (${dif >= 0 ? "+" : ""}${dif.toFixed(1)}) · mejoran ${f.mejoran}, empeoran ${f.empeoran}`;
+            dato.classList.add(dif > 0.2 ? "gana" : (dif < -0.2 ? "pierde" : "igual"));
+          } else {
+            dato.textContent = "sin medir";
+          }
+          fila.append(b, dato);
+          lista.append(fila);
+        });
+        if(d.corriendo){
+          btn.disabled = true;
+          const paso = d.n ? ` ${Math.min(d.i + 1, d.n)}/${d.n}` : "";
+          est.textContent = `Midiendo${paso}…` + (d.detalle ? ` (${d.detalle})` : "");
+          return;
+        }
+        btn.disabled = false;
+        if(d.etapa === "error" && d.error){ est.textContent = "No se pudo medir: " + d.error; return; }
+        const u = d.ultima;
+        if(u && base){
+          const todas = filas.todas;
+          est.textContent = `Última medición (${u.fecha}, ${u.temas} temas): el detector de siempre coincide ${base.triada}%`
+            + (todas ? `; con todas juntas, ${todas.triada}%.` : ".")
+            + (u.excluidos && u.excluidos.length ? ` Quedaron afuera ${u.excluidos.length} con el MIDI probablemente desfasado.` : "");
+        } else {
+          est.textContent = "Todavía no se midió. Hace falta al menos un tema con un MIDI importado.";
+        }
+      }
+      async function guardar(clave, prender){
+        const nuevas = new Set(elegidas);
+        if(prender) nuevas.add(clave); else nuevas.delete(clave);
+        try{
+          const r = await fetch("/detector/variantes", { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ variantes: [...nuevas] }) });
+          if(!r.ok) throw new Error(`HTTP ${r.status}`);
+          consultar();
+        }catch(e){
+          if(window.mesaAviso) mesaAviso("No se pudo guardar: " + e.message, { error: true });
+        }
+      }
+      async function consultar(){
+        try{
+          const r = await fetch("/detector/medicion", { cache: "no-store" });
+          const d = await r.json();
+          pintar(d);
+          if(d.corriendo && !timer) timer = setInterval(consultar, 2000);
+          if(!d.corriendo && timer){ clearInterval(timer); timer = null; }
+        }catch(e){ /* sin conexión con la PC */ }
+      }
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        est.textContent = "Arrancando…";
+        try{
+          const r = await fetch("/detector/medir", { method: "POST" });
+          const d = await r.json().catch(() => ({}));
+          if(!r.ok && r.status !== 409) throw new Error(d.error || `HTTP ${r.status}`);
+        }catch(e){
+          est.textContent = "No se pudo arrancar: " + e.message;
+          btn.disabled = false;
+          return;
+        }
+        consultar();
+      });
+      document.getElementById("detector-variantes").addEventListener("toggle", consultar, { once: true });
+    })();
+    </script>
+
+    {% if not es_la_pc %}
+    <!-- Solo en dispositivos que reciben el audio por red. En la PC la ventana
+         carga desde 127.0.0.1 y bajar la calidad no ahorra nada, así que ahí ni
+         se muestra. Va por cookie (este dispositivo), no en prefs.json: si fuera
+         global, ponerlo en mono desde la tablet degradaría también la PC. -->
+    <div class="grupo" data-calidad="{{ calidad_actual }}">
+      <div class="grupo-titulo">Audio en este dispositivo</div>
+      <div class="grupo-cuerpo">
+        <div class="grupo-fila">
+          <button class="boton-chico calidad{{ ' marcado' if calidad_actual in ('estereo160','estereo96') else '' }}" data-canal="estereo">Estéreo</button>
+          <button class="boton-chico calidad{{ ' marcado' if calidad_actual in ('mono160','mono96') else '' }}" data-canal="mono">Mono</button>
+        </div>
+        <div class="grupo-fila">
+          <button class="boton-chico calidad{{ ' marcado' if calidad_actual in ('estereo160','mono160') else '' }}" data-bitrate="160">160k</button>
+          <button class="boton-chico calidad{{ ' marcado' if calidad_actual in ('estereo96','mono96') else '' }}" data-bitrate="96">96k</button>
+        </div>
+        <span id="calidad-peso" class="grupo-valor" style="font-size:13px;"></span>
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="grupo grupo-ancho grupo-colores">
+      <div class="grupo-titulo">Barra del acorde</div>
+      <div class="grupo-cuerpo">
+        <button id="toggle-color-duracion" class="boton-chico interruptor{{ ' destacado' if colorear_duracion else '' }}" title="Colorear la barra según cuánto dura el acorde: medio compás, un compás o dos o más"><span class="interruptor-pista"></span>Colorear según la duración</button>
+        <div id="colores-bandas" class="colores-bandas">
+          {% for banda, etiqueta, detalle, largo in (('corto','Corto','medio compás o menos','22%'), ('normal','Normal','1 compás','50%'), ('largo','Largo','2 compases o más','100%')) %}
+          {% set elegido = color_corto if banda=='corto' else (color_normal if banda=='normal' else color_largo) %}
+          <div class="colores-fila" data-banda="{{ banda }}" style="--sel: {{ stem_colores[elegido] }};">
+            <div class="colores-info">
+              <span class="colores-etiqueta">{{ etiqueta }}<small>{{ detalle }}</small></span>
+              <span class="colores-muestra"><i style="width:{{ largo }};"></i></span>
+            </div>
+            <div class="colores-swatches" role="radiogroup" aria-label="Color para la banda {{ etiqueta|lower }}">
+              {% for stem in stem_order %}
+              <button class="swatch-color{{ ' seleccionado' if elegido == stem else '' }}"
+                      data-stem="{{ stem }}" style="--sw: {{ stem_colores[stem] }};" title="{{ stem_labels[stem] }}" aria-label="{{ stem_labels[stem] }}"></button>
+              {% endfor %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="grupo grupo-ancho grupo-tema-color">
+      <div class="grupo-titulo">Color de la app</div>
+      <div class="grupo-cuerpo">
+        <div class="tema-presets" role="radiogroup" aria-label="Color base de la app">
+          <button class="swatch-color tema-preset" data-color="" style="--sw: #f2b33d;" title="Ámbar (original)" aria-label="Ámbar (original)"></button>
+          <button class="swatch-color tema-preset" data-color="#9585ff" style="--sw: #9585ff;" title="Violeta" aria-label="Violeta"></button>
+          <button class="swatch-color tema-preset" data-color="#4c8dff" style="--sw: #4c8dff;" title="Azul" aria-label="Azul"></button>
+          <button class="swatch-color tema-preset" data-color="#2fcf8a" style="--sw: #2fcf8a;" title="Verde" aria-label="Verde"></button>
+          <button class="swatch-color tema-preset" data-color="#ff5a6e" style="--sw: #ff5a6e;" title="Rojo" aria-label="Rojo"></button>
+          <button class="swatch-color tema-preset" data-color="#9aa0a6" style="--sw: #9aa0a6;" title="Gris neutro" aria-label="Gris neutro"></button>
+          <button class="swatch-color tema-preset tema-preset-mono" data-color="mono" style="--sw: linear-gradient(135deg, #000 50%, #fff 50%);" title="Blanco y negro" aria-label="Blanco y negro"></button>
+        </div>
+        <div class="grupo-fila tema-elegir">
+          <input id="color-base" type="color" class="campo-color" value="{{ color_base if color_base.startswith('#') else '#f2b33d' }}" title="Elegir cualquier color" aria-label="Elegir cualquier color">
+          <button id="color-base-original" class="boton-chico" title="Volver a la paleta original">Volver al original</button>
+        </div>
+        <span class="grupo-nota">Vale para toda la app, en la PC y en la tablet. No cambian el rojo de mute, el celeste de rasgueo ni los colores de la barra.</span>
+      </div>
+    </div>
+
+    <div class="grupo grupo-ancho grupo-gafas">
+      <div class="grupo-titulo">Gafas HUD</div>
+      <div class="grupo-cuerpo">
+        <div class="tiles">
+          <button id="toggle-hud" class="boton-chico tile{{ ' destacado' if hud_activo else '' }}" title="Transmitir a HUD"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.5a9.5 9.5 0 0 1 13 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1" fill="currentColor"/></svg><span>Transmitir</span></button>
+          <button id="toggle-hud-ble" class="boton-chico tile{{ ' destacado' if hud_ble else '' }}" title="Bluetooth desde la PC"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 7l10 10-5 5V2l5 5L7 17"/></svg><span>BT de la PC</span></button>
+          {% if en_mesa %}
+          <button id="conectar-gafas-local" class="boton-chico tile" title="Bluetooth desde este dispositivo"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M10.5 18.5h3"/></svg><span>Conectar acá</span></button>
+          {% endif %}
+          <button id="toggle-hud-invertido" class="boton-chico tile{{ ' destacado' if hud_invertido else '' }}" title="Invertir colores"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor"/></svg><span>Invertir</span></button>
+        </div>
+        <div class="hud-chips">
+          <span id="chip-hud-estado"><span class="punto"></span><span class="texto"></span></span>
+          <span id="chip-hud-ble"><span class="punto"></span><span class="texto"></span></span>
+          {% if en_mesa %}
+          <span id="chip-hud-ble-local"><span class="punto"></span><span class="texto">sin conectar</span></span>
+          {% endif %}
+        </div>
+        <div class="grupo-fila hud-brillo">
+          <button id="hud-brillo-menos" class="boton-chico" title="Bajar el brillo de las gafas" aria-label="Bajar el brillo">&minus;</button>
+          <span id="hud-brillo-actual" class="grupo-valor" data-nivel="{{ hud_brillo }}" data-max="{{ hud_brillos|length }}">brillo {{ hud_brillo }}/{{ hud_brillos|length }}</span>
+          <button id="hud-brillo-mas" class="boton-chico" title="Subir el brillo de las gafas" aria-label="Subir el brillo">+</button>
+        </div>
+        {% if not en_mesa %}
+        <span class="grupo-nota">«Conectar acá» (Bluetooth de la tablet) está dentro de cada tema: esa conexión se corta al salir de la pantalla del tema.</span>
+        {% endif %}
+      </div>
+    </div>
+
+  </div>
+</div>

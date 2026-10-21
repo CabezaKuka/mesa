@@ -1,0 +1,232 @@
+
+<!-- v113: ventana de progreso al estilo "transcribiendo": anillo con el
+     porcentaje real de Demucs, barra, tiempo transcurrido / estimado y tips. -->
+<style>
+  body{ justify-content:center; align-items:center; min-height:100vh; }
+  .proc-velo{
+    position:fixed; inset:0; z-index:0; pointer-events:none;
+    background:radial-gradient(600px 380px at 50% 45%, color-mix(in srgb, var(--brass) 10%, transparent), transparent 70%);
+  }
+  .proc-ventana{
+    position:relative; z-index:1; width:min(560px, calc(100vw - 32px)); box-sizing:border-box;
+    background:var(--panel); border:1px solid var(--panel-3); border-radius:16px;
+    box-shadow:0 24px 60px rgba(0,0,0,.45); padding:30px 28px 22px; text-align:center;
+  }
+  .proc-titulo{ margin:0; font-size:18px; font-weight:550; color:var(--fg); }
+  .proc-tema{
+    margin:6px 0 0; font-size:15px; font-weight:700; font-style:italic; color:var(--fg);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-height:20px;
+  }
+  .proc-anillo{ position:relative; width:118px; height:118px; margin:24px auto 26px; }
+  .proc-anillo svg{ position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
+  .proc-anillo .pista{ stroke:var(--panel-3); }
+  .proc-anillo .avance{
+    stroke:var(--brass); stroke-linecap:round; transform:rotate(-90deg); transform-origin:50% 50%;
+    transition:stroke-dashoffset .6s ease;
+  }
+  .proc-anillo .orbita{ transform-origin:50% 50%; animation:proc-gira 2.4s linear infinite; }
+  .proc-anillo .orbita circle{ stroke:var(--brass); opacity:.55; stroke-linecap:round; }
+  .proc-anillo.sin-pct .avance{ opacity:0; }
+  .proc-anillo.sin-pct .orbita{ animation-duration:1.1s; }
+  .proc-anillo.sin-pct .orbita circle{ opacity:1; }
+  .proc-pct{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    font-size:24px; font-weight:800; color:var(--fg); font-variant-numeric:tabular-nums;
+  }
+  .proc-anillo.con-error .avance, .proc-anillo.con-error .orbita circle{ stroke:var(--led-mute); }
+  .proc-anillo.con-error .orbita{ display:none; }
+  .proc-anillo.con-error .proc-pct{ color:var(--led-mute); }
+  @keyframes proc-gira{ to{ transform:rotate(360deg); } }
+
+  .proc-barra{ height:8px; border-radius:999px; background:var(--panel-3); overflow:hidden; }
+  .proc-barra i{
+    display:block; height:100%; width:0; border-radius:999px; background:var(--brass);
+    transition:width .6s ease;
+  }
+  .proc-barra.indefinida i{ width:30%; animation:proc-corre 1.4s ease-in-out infinite; }
+  .proc-barra.con-error i{ background:var(--led-mute); animation:none; }
+  @keyframes proc-corre{ 0%{ transform:translateX(-100%); } 100%{ transform:translateX(340%); } }
+  .proc-tiempos{
+    display:flex; justify-content:space-between; gap:12px; margin:8px 0 18px;
+    font-size:13px; font-weight:600; color:var(--fg); font-variant-numeric:tabular-nums;
+  }
+  .proc-tiempos #proc-estimado{ color:var(--fg-dim); }
+
+  .proc-tip{
+    display:flex; align-items:center; justify-content:center; gap:10px; min-height:48px;
+    background:var(--panel-2); border-radius:10px; padding:12px 16px;
+    font-size:13px; color:var(--fg); text-align:left; transition:opacity .35s ease;
+  }
+  .proc-tip svg{ flex:0 0 auto; width:18px; height:18px; color:var(--brass); }
+  .proc-tip.oculto{ opacity:0; }
+
+  .proc-error{
+    display:none; margin:0 0 16px; padding:12px 14px; border-radius:10px; text-align:left;
+    background:color-mix(in srgb, var(--led-mute) 12%, var(--panel-2));
+    color:var(--fg); font-size:13px; line-height:1.55; white-space:pre-line;
+    max-height:40vh; overflow:auto;
+  }
+  .proc-pie{ margin-top:16px; font-size:12.5px; }
+  .proc-pie a{ color:var(--fg-dim); text-decoration:none; }
+  .proc-pie a:hover{ color:var(--fg); text-decoration:underline; }
+  #procesando-volver{ display:none; margin-top:4px; text-decoration:none; }
+</style>
+<div class="proc-velo" aria-hidden="true"></div>
+<div class="proc-ventana" role="status" aria-live="polite">
+  <p class="proc-titulo" id="proc-titulo">Separando pistas de:</p>
+  <p class="proc-tema" id="proc-tema">{{ titulo_tema or "…" }}</p>
+
+  <div class="proc-anillo sin-pct" id="proc-anillo">
+    <svg viewBox="0 0 120 120" aria-hidden="true">
+      <circle class="pista" cx="60" cy="60" r="44" fill="none" stroke-width="4"/>
+      <circle class="avance" id="proc-arco" cx="60" cy="60" r="44" fill="none" stroke-width="4"
+              stroke-dasharray="276.46" stroke-dashoffset="276.46"/>
+      <g class="orbita">
+        <circle cx="60" cy="60" r="55" fill="none" stroke-width="3" stroke-dasharray="70 276"/>
+        <circle cx="60" cy="60" r="55" fill="none" stroke-width="2" stroke-dasharray="26 320" stroke-dashoffset="-175"/>
+      </g>
+    </svg>
+    <div class="proc-pct" id="proc-pct">…</div>
+  </div>
+
+  <div class="proc-barra indefinida" id="proc-barra"><i id="proc-relleno"></i></div>
+  <div class="proc-tiempos">
+    <span id="proc-etapa">empezando (00:00)</span>
+    <span id="proc-estimado"></span>
+  </div>
+
+  <div class="proc-error" id="proc-error"></div>
+  <div class="proc-tip" id="proc-tip">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1V17h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z"/></svg>
+    <span id="proc-tip-texto">Cuando termine, la pantalla pasa sola al mezclador.</span>
+  </div>
+  <a id="procesando-volver" href="{{ url_for('home') }}"><button type="button" class="boton-primario">&larr; Volver</button></a>
+  <div class="proc-pie" id="proc-pie">
+    <a href="{{ url_for('home') }}">Ir a la portada &mdash; sigue en segundo plano</a>
+  </div>
+</div>
+<script>
+  const jobId = "{{ job_id }}";
+  const $ = id => document.getElementById(id);
+  const CIRC = 276.46;   // 2·π·44
+
+  const TIPS = [
+    "Cuando termine, la pantalla pasa sola al mezclador.",
+    "Podés ir a la portada: el trabajo sigue en la PC y aparece en «En proceso».",
+    "Demucs usa casi toda la CPU: si la PC se pone lenta mientras tanto, es normal.",
+    "Si tenés el MIDI de Chordify del tema, importalo después y los acordes quedan exactos.",
+    "Las pistas quedan guardadas: la próxima vez el tema abre al instante.",
+  ];
+  let tipIdx = 0;
+  const relojTips = setInterval(() => {
+    const t = $("proc-tip");
+    t.classList.add("oculto");
+    setTimeout(() => {
+      tipIdx = (tipIdx + 1) % TIPS.length;
+      $("proc-tip-texto").textContent = TIPS[tipIdx];
+      t.classList.remove("oculto");
+    }, 350);
+  }, 7000);
+
+  const mmss = s => {
+    s = Math.max(0, Math.round(s || 0));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    const p = n => String(n).padStart(2, "0");
+    return h ? `${h}:${p(m)}:${p(x)}` : `${p(m)}:${p(x)}`;
+  };
+
+  // El tiempo corre de a un segundo en pantalla aunque el sondeo sea cada 1,5 s
+  // (o se corte un rato el wifi): se ancla al último "elapsed" del servidor.
+  let base = { elapsed: 0, en: performance.now() };
+  let etapaTxt = "empezando";
+  let terminado = false;
+  const relojTiempo = setInterval(() => {
+    if(terminado) return;
+    const seg = base.elapsed + (performance.now() - base.en) / 1000;
+    $("proc-etapa").textContent = `${etapaTxt} (${mmss(seg)})`;
+  }, 250);
+
+  function pintarPct(pct){
+    const anillo = $("proc-anillo"), barra = $("proc-barra");
+    if(pct == null){
+      anillo.classList.add("sin-pct"); barra.classList.add("indefinida");
+      $("proc-pct").textContent = "…";
+      return;
+    }
+    const v = Math.max(0, Math.min(100, pct));
+    anillo.classList.remove("sin-pct"); barra.classList.remove("indefinida");
+    $("proc-arco").style.strokeDashoffset = CIRC * (1 - v / 100);
+    $("proc-relleno").style.width = v + "%";
+    $("proc-pct").textContent = Math.floor(v) + "%";
+  }
+
+  const ETAPAS = {
+    en_cola: "en cola",
+    descargando: "descargando de YouTube",
+    cargando: "cargando el modelo",
+    separando: "separando",
+    mp3: "preparando las pistas",
+    acordes: "detectando acordes y pulso",
+  };
+
+  let fallosSeguidos = 0;
+  async function poll(){
+    let j, r;
+    try{
+      r = await fetch(`/estado/${jobId}`, { cache: "no-store" });
+      j = await r.json();
+      fallosSeguidos = 0;
+    }catch(e){
+      fallosSeguidos++;
+      etapaTxt = `sin conexión con Mesa, reintentando (${fallosSeguidos})`;
+      setTimeout(poll, Math.min(3000 + fallosSeguidos * 500, 8000));
+      return;
+    }
+    if(r.status === 404){
+      mostrarError("Mesa se reinició y este trabajo ya no existe. Volvé y subí el tema de nuevo.");
+      return;
+    }
+    base = { elapsed: j.elapsed || 0, en: performance.now() };
+    if(j.titulo) $("proc-tema").textContent = j.titulo;
+    if(j.status === "listo"){
+      pintarPct(100);
+      etapaTxt = "listo";
+      setTimeout(() => { window.location = j.redirect; }, 350);
+      return;
+    }
+    if(j.status === "error"){
+      mostrarError(j.log || "ver consola");
+      return;
+    }
+    const clave = j.status === "procesando" ? (j.etapa || "cargando") : j.status;
+    etapaTxt = ETAPAS[clave] || j.status;
+    $("proc-titulo").textContent = j.status === "descargando" ? "Descargando el audio de:" : "Separando pistas de:";
+    // Mientras carga el modelo o está en cola no hay porcentaje real: anillo girando.
+    const hayPct = j.status === "procesando" && clave !== "cargando" && j.progreso != null;
+    pintarPct(hayPct ? j.progreso : null);
+    $("proc-estimado").textContent = j.estimado ? `(Estimado: ${mmss(j.estimado)})` : "";
+    setTimeout(poll, 1500);
+  }
+
+  function mostrarError(texto){
+    terminado = true;
+    clearInterval(relojTips); clearInterval(relojTiempo);
+    $("proc-titulo").textContent = "No se pudo separar:";
+    $("proc-anillo").classList.remove("sin-pct");
+    $("proc-anillo").classList.add("con-error");
+    $("proc-pct").textContent = "!";
+    $("proc-arco").style.strokeDashoffset = 0;
+    $("proc-barra").classList.remove("indefinida");
+    $("proc-barra").classList.add("con-error");
+    $("proc-relleno").style.width = "100%";
+    $("proc-etapa").textContent = "error";
+    $("proc-estimado").textContent = "";
+    const e = $("proc-error");
+    e.textContent = texto;
+    e.style.display = "block";
+    $("proc-tip").style.display = "none";
+    $("proc-pie").style.display = "none";
+    $("procesando-volver").style.display = "inline-block";
+  }
+  poll();
+</script>

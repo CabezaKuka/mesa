@@ -1,0 +1,12 @@
+# Datos de cada instalación: pesan GB y son de cada PC, no del código
+uploads/
+separated/
+ml_cache/
+modelo_acordes.npz
+modelo_acordes.tmp.npz
+transiciones_acordes.json
+*.crt
+*.key
+# Python
+__pycache__/
+*.pyc

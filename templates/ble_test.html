@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="es"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prueba BLE - Mesa</title>
+<style>
+  body{ background:#000; color:#fff; font:14px -apple-system,"Segoe UI",Roboto,sans-serif;
+        margin:0; padding:16px; }
+  h1{ font-size:16px; margin:0 0 12px; }
+  button{ display:block; width:100%; margin:0 0 10px; padding:14px; font-size:15px;
+          background:#fff; color:#000; border:0; border-radius:8px; font-weight:600; }
+  button.sec{ background:#191919; color:#fff; border:1px solid #333; font-weight:500; }
+  #log{ background:#000; color:#0f0; font:11px/1.5 monospace; padding:10px;
+        border-radius:8px; word-break:break-word; min-height:220px; }
+  #log div{ margin:0 0 2px; }
+</style>
+<h1>Prueba de Bluetooth &mdash; Mesa</h1>
+<button id="b1">1. Buscar solo MesaHUD</button>
+<button id="b2" class="sec">2. Ver TODOS los dispositivos BLE</button>
+<button id="b3" class="sec">3. Mandar un acorde de prueba</button>
+<div id="log"></div>
+<script>
+const SERV = "6e6d0001-b5a3-f393-e0a9-e50e24dcca9e";
+const CAR  = "6e6d0002-b5a3-f393-e0a9-e50e24dcca9e";
+const elLog = document.getElementById("log");
+let caract = null;
+
+function log(m){
+  const d = document.createElement("div");
+  d.textContent = m;
+  elLog.appendChild(d);
+  elLog.scrollTop = elLog.scrollHeight;
+}
+
+window.addEventListener("error", (e) => log("ERROR JS: " + e.message + " @ linea " + e.lineno));
+
+log("Web Bluetooth: " + (navigator.bluetooth ? "SI" : "NO, este navegador no lo soporta"));
+log("contexto seguro (https): " + window.isSecureContext);
+log("origen: " + location.origin);
+log("app instalada: " + (window.matchMedia("(display-mode: standalone)").matches
+    || window.matchMedia("(display-mode: fullscreen)").matches ? "SI" : "no, pestana normal"));
+if(navigator.bluetooth && navigator.bluetooth.getAvailability){
+  navigator.bluetooth.getAvailability().then(v => log("adaptador BT disponible: " + (v ? "SI" : "NO, prende el Bluetooth")));
+}
+log("---");
+
+async function conectar(opciones){
+  if(!navigator.bluetooth){ log("ABORTADO: no hay navigator.bluetooth"); return; }
+  try{
+    log("pidiendo dispositivo...");
+    const d = await navigator.bluetooth.requestDevice(opciones);
+    log("elegido: " + (d.name || "(sin nombre)"));
+    log("conectando GATT...");
+    const s = await d.gatt.connect();
+    log("GATT conectado");
+    const srv = await s.getPrimaryService(SERV);
+    log("servicio ok");
+    caract = await srv.getCharacteristic(CAR);
+    log("caracteristica ok. LISTO, proba el boton 3");
+  }catch(e){
+    log("ERROR " + e.name + ": " + e.message);
+    if(e.name === "NotFoundError"){
+      log("  NotFoundError = cancelaste el selector, O el Bluetooth esta apagado,");
+      log("  O Chrome no tiene permiso de Ubicacion, O ninguna placa coincide.");
+    }
+    if(e.name === "SecurityError") log("  la pagina no esta en contexto seguro");
+  }
+}
+
+document.getElementById("b1").onclick = () => conectar({
+  filters: [{ name: "MesaHUD" }], optionalServices: [SERV],
+});
+document.getElementById("b2").onclick = () => conectar({
+  acceptAllDevices: true, optionalServices: [SERV],
+});
+document.getElementById("b3").onclick = async () => {
+  if(!caract){ log("todavia no hay conexion: usa el boton 1 o 2"); return; }
+  try{
+    const payload = JSON.stringify({ c: "Am", n: "F", d: 2.0, b: 0, i: 0 });
+    await caract.writeValueWithoutResponse(new TextEncoder().encode(payload));
+    log("enviado: " + payload + " (" + payload.length + " bytes)");
+    log("  si en las gafas no aparece Am, mira el Serial del ESP32");
+  }catch(e){ log("ERROR al escribir " + e.name + ": " + e.message); }
+};
+</script>
+</html>

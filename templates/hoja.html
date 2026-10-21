@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ titulo }}{{ ' - ' ~ autor if autor else '' }} (acordes)</title>
+<style>
+  /* colores que espera svgAcorde: en papel, todo negro y grises */
+  :root{ --fg-dim:#333; --diag-linea:#8a8a8a; --diag-tenue:#666; --brass:#111; }
+  @page{ size:A4; margin:13mm 12mm 14mm; }
+  *{ box-sizing:border-box; }
+  html{ background:#e6e6ea; }
+  body{
+    margin:0 auto; max-width:210mm; min-height:100vh; background:#fff; color:#111;
+    font:14px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding:0 12mm 16mm; -webkit-print-color-adjust:exact; print-color-adjust:exact;
+  }
+  .barra{
+    position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    margin:0 -12mm 10mm; padding:10px 12mm; background:#1b1b20; color:#ddd; font-size:13px;
+  }
+  .barra a, .barra button, .barra select{
+    font:inherit; color:#eee; background:#2e2e36; border:0; border-radius:999px;
+    padding:8px 14px; text-decoration:none; cursor:pointer;
+  }
+  .barra .primario{ background:#f2b33d; color:#1a1306; font-weight:700; }
+  .barra .activo{ background:rgba(242,179,61,.22); color:#f2b33d; }
+  .barra .esp{ flex:1; }
+  .aviso{ margin:0 0 10px; padding:8px 12px; border-radius:8px; background:#fff4d6; color:#5a4300; font-size:12.5px; }
+  .vacio{ padding:40px 0; text-align:center; color:#555; }
+
+  header{ border-bottom:2px solid #111; padding-bottom:10px; margin-bottom:12px; }
+  header h1{ margin:0; font-size:26px; font-weight:800; letter-spacing:-.01em; line-height:1.15; }
+  header .autor{ font-size:15px; color:#444; margin-top:2px; }
+  header .meta{ margin-top:8px; font-size:13px; color:#222; display:flex; gap:6px 16px; flex-wrap:wrap; }
+
+  .diagramas{ display:flex; flex-wrap:wrap; gap:4px 8px; margin:0 0 14px; break-inside:avoid; page-break-inside:avoid; }
+  .diag{ display:flex; flex-direction:column; align-items:center; min-width:56px; }
+  .diag-nombre{ font:700 14px ui-monospace, "Cascadia Mono", Consolas, monospace; margin-bottom:-2px; }
+  .diag-nombre small, .ac small{ font-size:.62em; font-weight:600; }
+
+  .fila{
+    display:grid; grid-template-columns:28px repeat({{ por_fila }}, minmax(0, 1fr));
+    margin:0 0 8px; break-inside:avoid; page-break-inside:avoid;
+  }
+  .num{ font:600 10px ui-monospace, Consolas, monospace; color:#888; text-align:right; padding:3px 6px 0 0; }
+  .compas{
+    position:relative; display:grid; align-items:center; min-width:0;
+    height:52px; border-left:2px solid #111; padding:0 4px 0 7px;
+  }
+  .compas.cierra{ border-right:2px solid #111; }
+  .compas.final{ border-right:6px double #111; }
+  .ac{ font:700 19px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space:nowrap; overflow:hidden; text-overflow:clip; }
+  .ac.sil{ color:#999; font-weight:400; }
+  .rep{ grid-column:1 / -1; text-align:center; font:700 22px ui-monospace, Consolas, monospace; color:#555; }
+  .capa{ position:absolute; left:7px; right:4px; display:grid; pointer-events:none; }
+  .ticks{ bottom:5px; }
+  .ticks i{ display:block; width:7px; height:2px; background:#c8c8c8; }
+  .marcas{ top:1px; font-size:9px; line-height:1; color:#111; }
+
+  .leyenda{ margin-top:14px; padding-top:8px; border-top:1px solid #ccc; font-size:11px; color:#555; display:flex; gap:6px 18px; flex-wrap:wrap; }
+
+  @media (max-width:600px){
+    body{ padding:0 10px 16px; }
+    .barra{ margin:0 -10px 14px; padding:10px; }
+    .ac{ font-size:15px; }
+    .fila{ grid-template-columns:22px repeat({{ por_fila }}, minmax(0, 1fr)); }
+  }
+  @media print{
+    html{ background:#fff; }
+    body{ max-width:none; padding:0; min-height:0; }
+    .barra, .aviso{ display:none !important; }
+  }
+</style>
+
+<div class="barra">
+  <button class="primario" type="button" onclick="window.print()">Imprimir / Guardar PDF</button>
+  {% if hoja and hoja.capo %}
+  <a class="{{ '' if reales else 'activo' }}" href="{{ url_con(reales=0) }}">Como se tocan (cejilla {{ hoja.capo }})</a>
+  <a class="{{ 'activo' if reales else '' }}" href="{{ url_con(reales=1) }}">Como suenan</a>
+  {% endif %}
+  <select aria-label="Compases por línea" onchange="location.href=this.value">
+    {% for k in (3, 4, 6, 8) %}
+    <option value="{{ url_con(cpf=k) }}"{{ ' selected' if k == por_fila else '' }}>{{ k }} compases por línea</option>
+    {% endfor %}
+  </select>
+  <a class="{{ 'activo' if diagramas else '' }}" href="{{ url_con(diag=0 if diagramas else 1) }}">Diagramas</a>
+  <span class="esp"></span>
+  <a href="{{ url_for('mesa', song=song) }}">Volver a Mesa</a>
+</div>
+
+<header>
+  <h1>{{ titulo }}</h1>
+  {% if autor %}<div class="autor">{{ autor }}</div>{% endif %}
+  {% if hoja %}
+  <div class="meta">
+    {% if hoja.bpm %}<span>&#9833; = {{ hoja.bpm }}</span>{% endif %}
+    <span>{{ hoja.bpc }}/4</span>
+    {% if hoja.capo %}<span>Cejilla en traste {{ hoja.capo }} &middot; {{ 'acordes como suenan' if reales else 'acordes como se tocan' }}</span>{% endif %}
+    <span>{{ hoja.total }} compases</span>
+  </div>
+  {% endif %}
+</header>
+
+{% if hoja %}
+  {% if hoja.aviso %}<div class="aviso">{{ hoja.aviso }}</div>{% endif %}
+
+  {% if diagramas and diag_js and hoja.usados %}
+  <div class="diagramas">
+    {% for a in hoja.usados %}
+    <div class="diag" data-acorde="{{ a.nombre }}"><span class="diag-nombre">{{ a.raiz }}{% if a.sufijo %}<small>{{ a.sufijo }}</small>{% endif %}</span></div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% for fila in hoja.filas %}
+  <div class="fila">
+    <div class="num">{{ fila[0].num }}</div>
+    {% for c in fila %}
+    <div class="compas{{ ' cierra' if loop.last else '' }}{{ ' final' if c.num == hoja.ultimo_num else '' }}" style="grid-template-columns:repeat({{ hoja.bpc }}, minmax(0, 1fr));">
+      {% if c.repite %}<span class="rep">%</span>
+      {% elif c.silencio %}<span class="ac sil" style="grid-column:1 / -1;">&mdash;</span>
+      {% else %}{% for it in c.partes %}<span class="ac{{ ' sil' if it.acorde == '—' else '' }}" style="grid-column:{{ it.col + 1 }} / span {{ it.span }};">{{ it.raiz }}{% if it.sufijo %}<small>{{ it.sufijo }}</small>{% endif %}</span>{% endfor %}{% endif %}
+      <div class="capa ticks" style="grid-template-columns:repeat({{ hoja.bpc }}, 1fr);">{% for b in range(hoja.bpc) %}<i></i>{% endfor %}</div>
+      {% if c.rasgueo %}<div class="capa marcas" style="grid-template-columns:repeat({{ hoja.bpc }}, 1fr);">{% for b in c.rasgueo %}<span style="grid-column:{{ b + 1 }};">&#9660;</span>{% endfor %}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endfor %}
+
+  <div class="leyenda">
+    <span>% = igual al compás anterior</span>
+    <span>&mdash; = sin acorde</span>
+    <span>&#9660; = cambio de rasgueo</span>
+    <span>El número de cada línea es el compás de Mesa</span>
+  </div>
+{% else %}
+  <p class="vacio">{{ error or 'Este tema todavía no tiene grilla de compases. Abrilo en Mesa para que se analice (si no tiene batería, no hay compases para armar la hoja).' }}</p>
+{% endif %}
+
+{% if hoja and diagramas and diag_js %}
+<script>
+{{ diag_js|safe }}
+document.querySelectorAll(".diag[data-acorde]").forEach(function(el){
+  var svg = svgAcorde(el.dataset.acorde, 0.8);
+  if(svg) el.insertAdjacentHTML("beforeend", svg);
+});
+</script>
+{% endif %}
+</html>
