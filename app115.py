@@ -7479,6 +7479,35 @@ BASE_STYLE = """<!doctype html>
     #barra-estudio > .estudio-grupo:last-child .btn-ico-lbl{ font-size:0; gap:0; min-width:42px; min-height:44px; padding:6px; }
   }
 
+  /* ayuda con mantener apretado (pantallas táctiles) */
+  #mesa-ayuda{
+    position:fixed; z-index:10001; max-width:min(320px, calc(100vw - 16px)); padding:9px 13px;
+    border-radius:12px; background:var(--fg); color:var(--sobre-acento); font-size:13.5px; line-height:1.35;
+    box-shadow:0 10px 30px rgba(0,0,0,.4); pointer-events:none; opacity:0; transform:translateY(4px);
+    transition:opacity .15s ease, transform .15s ease;
+  }
+  #mesa-ayuda.visible{ opacity:1; transform:none; }
+  /* atajos de teclado */
+  @media (hover: none){ .solo-teclado{ display:none !important; } }
+  #ayuda-atajos{
+    position:fixed; inset:0; z-index:10000; display:none; align-items:center; justify-content:center;
+    padding:16px; background:rgba(0,0,0,.55);
+  }
+  #ayuda-atajos.visible{ display:flex; }
+  .ayuda-caja{
+    width:min(520px, 100%); max-height:calc(100dvh - 32px); overflow:auto; padding:18px 20px;
+    border-radius:20px; background:var(--panel); color:var(--fg); box-shadow:0 20px 60px rgba(0,0,0,.5);
+  }
+  .ayuda-cab{ display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; font-size:16px; }
+  #ayuda-atajos dl{ display:grid; grid-template-columns:auto 1fr; gap:8px 16px; margin:0 0 12px; }
+  #ayuda-atajos dt{ font-family:var(--mono); font-weight:700; color:var(--brass); white-space:nowrap; }
+  #ayuda-atajos dd{ margin:0; color:var(--fg-dim); }
+  /* con ancho de sobra, los accesos de la cabecera muestran su nombre */
+  @media (min-width: 1300px) and (hover: hover){
+    .accesos-ajustes .boton-chico{ width:auto; padding:0 16px 0 13px; border-radius:999px; gap:7px; }
+    .accesos-ajustes .boton-chico .solo-ancho{ display:inline; font-size:13.5px; font-weight:600; }
+  }
+
   /* cartel en dos pisos para el celular (body.cartel-angosto lo pone el JS) */
   body.cartel-angosto .fila-acordes{ height:calc(190px * var(--esc)); }
   body.cartel-angosto #acorde-actual{ top:36%; }
@@ -7606,6 +7635,69 @@ window.mesaAviso = function(texto, opciones){
   clearTimeout(el._temporizador);
   el._temporizador = setTimeout(() => el.classList.remove("visible"), o.duracion || (o.error ? 8000 : (o.accion ? 9000 : 4500)));
 };
+
+// v115: en pantallas táctiles no hay "pasar el mouse", así que las explicaciones de los
+// botones (sus title) no se veían nunca. Mantener apretado un botón ~0,45 s muestra su
+// explicación en una burbuja, y ese toque no cuenta como click.
+(function(){
+  if(!window.matchMedia || !window.matchMedia("(hover: none)").matches) return;
+  let temporizador = null, objetivo = null, mostrado = false, x0 = 0, y0 = 0, ocultarT = null;
+  let burbuja = null;
+  const textoDe = el => el.getAttribute("title") || el.dataset.ayuda || el.getAttribute("aria-label") || "";
+  function mostrar(el){
+    const texto = textoDe(el);
+    if(!texto) return;
+    if(!burbuja){
+      burbuja = document.createElement("div");
+      burbuja.id = "mesa-ayuda";
+      burbuja.setAttribute("role", "tooltip");
+      document.body.appendChild(burbuja);
+    }
+    burbuja.textContent = texto;
+    burbuja.classList.add("visible");
+    const r = el.getBoundingClientRect();
+    const b = burbuja.getBoundingClientRect();
+    let left = Math.max(8, Math.min(window.innerWidth - b.width - 8, r.left + r.width / 2 - b.width / 2));
+    let top = r.top - b.height - 10;
+    if(top < 8) top = r.bottom + 10;
+    burbuja.style.left = left + "px";
+    burbuja.style.top = top + "px";
+    mostrado = true;
+    if(navigator.vibrate) try{ navigator.vibrate(10); }catch(e){}
+  }
+  function ocultar(){ if(burbuja) burbuja.classList.remove("visible"); }
+  document.addEventListener("pointerdown", (e) => {
+    if(e.pointerType !== "touch") return;
+    mostrado = false;
+    clearTimeout(ocultarT); ocultar();
+    const el = e.target.closest && e.target.closest("button[title], a[title], [data-ayuda], button[aria-label], [role=button][title], .chip-estado[title], span[title]");
+    if(!el || !textoDe(el)) return;
+    objetivo = el; x0 = e.clientX; y0 = e.clientY;
+    clearTimeout(temporizador);
+    temporizador = setTimeout(() => mostrar(el), 450);
+  }, { passive: true });
+  document.addEventListener("pointermove", (e) => {
+    if(temporizador && Math.hypot(e.clientX - x0, e.clientY - y0) > 10){ clearTimeout(temporizador); temporizador = null; }
+  }, { passive: true });
+  ["pointerup", "pointercancel"].forEach(ev => document.addEventListener(ev, () => {
+    clearTimeout(temporizador); temporizador = null;
+    if(mostrado){ clearTimeout(ocultarT); ocultarT = setTimeout(ocultar, 2200); }
+  }, { passive: true }));
+  // si se mostró la explicación, ese toque no acciona el botón
+  document.addEventListener("click", (e) => {
+    if(mostrado){ e.stopPropagation(); e.preventDefault(); mostrado = false; }
+  }, true);
+  document.addEventListener("contextmenu", (e) => {
+    if(objetivo && objetivo.contains(e.target)) e.preventDefault();
+  });
+  // la primera vez, se cuenta que existe
+  try{
+    if(!localStorage.getItem("mesaTipAyuda")){
+      localStorage.setItem("mesaTipAyuda", "1");
+      setTimeout(() => window.mesaAviso && mesaAviso("Tip: mantené apretado cualquier botón para ver qué hace.", { duracion: 7000 }), 2500);
+    }
+  }catch(e){}
+})();
 
 // Registra el service worker (necesario para que Chrome/Android ofrezcan
 // "Instalar app": el manifest ya estaba completo, esto era lo único que
@@ -9586,6 +9678,7 @@ MESA_HTML = BASE_STYLE + """
       <button type="button" class="boton-chico" data-seccion="generales" title="Ajustes generales: qué se ve en el cartel, calidad y colores"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg><span class="solo-ancho">General</span></button>
       <button type="button" class="boton-chico" data-seccion="gafas" title="Gafas HUD: conexión, colores y brillo"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="14" r="3.5"/><circle cx="17" cy="14" r="3.5"/><path d="M10.5 14h3M3.5 13 5 7M20.5 13 19 7"/></svg><span class="solo-ancho">Gafas</span></button>
     </div>
+    <button id="abrir-atajos" type="button" class="boton-chico boton-icono solo-teclado" title="Atajos de teclado (?)" aria-label="Atajos de teclado"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10"/></svg></button>
     <button id="mostrar-pistas" type="button" class="boton-chico" title="Mostrar las pistas al costado" aria-label="Mostrar las pistas al costado"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16M8 10l2 2-2 2"/></svg></button>
     <button id="abrir-ajustes" type="button" class="boton-chico boton-icono con-texto" title="Mezcla, ajustes del tema y ajustes generales" aria-controls="cajon-ajustes" aria-expanded="false"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg><span class="solo-ancho">Ajustes</span></button>
     <button id="toggle-modo-tocar" class="boton-chico" style="flex:0 0 auto;" title="Dejar solo el cartel de acordes y el transporte, en grande (Esc para salir)">Modo tocar</button>
@@ -9791,26 +9884,14 @@ MESA_HTML = BASE_STYLE + """
     <span class="panel-plegable-flecha"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></span>
   </div>
   <div class="panel-plegable-cuerpo panel-controles-cuerpo">
+    <!-- v115: lo de todos los días primero (corregir), lo de vez en cuando
+         después (importar/exportar) y lo raro o destructivo al final (avanzado).
+         Los ids no cambian: el JS de siempre los sigue encontrando. -->
     <div class="grupo">
       <div class="grupo-titulo">Acordes</div>
       <div class="grupo-cuerpo">
         <button id="abrir-editor" class="boton-chico destacado">Editar acordes</button>
-        <div class="grupo-fila">
-          <button id="editar-acordes" class="boton-chico" title="Abrir acordes.txt con el Bloc de notas">Abrir .txt</button>
-          <button id="recargar-acordes" class="boton-chico" title="Releer acordes.txt sin recargar la página">Recargar</button>
-        </div>
-        <button id="importar-midi" class="boton-chico" title="Importar acordes desde un MIDI (ej. el que exporta Chordify)">Importar MIDI…</button>
-        <input id="archivo-midi" type="file" accept=".mid,.midi" style="display:none">
-        <!-- v103: cuánto coincide el detector de Mesa con el MIDI importado -->
-        <button id="comparar-detector" class="boton-chico" title="Vuelve a correr el detector de Mesa y mide cuánto coincide con los acordes del MIDI importado (no cambia los acordes)">Comparar con detector</button>
-        <span id="coincidencia-midi" class="grupo-valor" style="font-size:13px; display:none;"></span>
-        <!-- Antes vivía en la barra de transporte: es una acción de escritorio
-             (mezclar un mp3 para subirlo a Chordify), no algo que se toque
-             con la guitarra encima. -->
-        <button id="exportar" class="boton-chico" title="Mezcla las pistas que no están en mute en un solo mp3 (para subir a Chordify, por ejemplo)">Exportar mp3</button>
-        <!-- v114: hoja de acordes por compás para imprimir / guardar como PDF -->
-        <button id="hoja-imprimir" class="boton-chico" title="Abre la hoja de acordes por compás, lista para imprimir o guardar como PDF (usa lo último guardado)">Hoja para imprimir</button>
-        <button id="regenerar-acordes" class="boton-chico peligro" title="Volver a detectar los acordes desde cero (se pierden las correcciones)">Regenerar acordes</button>
+        <span class="grupo-nota">Los compases con <b>?</b> son donde el detector dudó: revisá esos primero.</span>
       </div>
     </div>
 
@@ -9818,6 +9899,7 @@ MESA_HTML = BASE_STYLE + """
       <div class="grupo-titulo">Sincronía</div>
       <div class="grupo-cuerpo">
         <span id="offset-actual" class="grupo-valor">0.00s</span>
+        <button id="tap-sincronia" type="button" class="boton-chico" title="Con el tema sonando, tocá este botón en cada tiempo: después de 4 toques corrige la sincronía sola (o usá la tecla S)">Tocá al ritmo</button>
         <div class="grupo-fila">
           <button id="offset-menos-fino" class="boton-chico" title="Atrasar 0.05s">&minus;0.05s</button>
           <button id="offset-mas-fino" class="boton-chico" title="Adelantar 0.05s">+0.05s</button>
@@ -9841,6 +9923,7 @@ MESA_HTML = BASE_STYLE + """
           <input id="bpm-manual" type="number" step="0.1" min="1" placeholder="exacto" class="campo-chico">
           <button id="bpm-ajustar" class="boton-chico" title="Recalcula toda la grilla al BPM exacto que pongas">Ajustar</button>
         </div>
+        <button id="tap-tempo" type="button" class="boton-chico" title="Tocá al ritmo de la música (5 o más toques): calcula el BPM y lo deja en el campo para Ajustar">Tap tempo</button>
       </div>
     </div>
 
@@ -9853,6 +9936,38 @@ MESA_HTML = BASE_STYLE + """
           <button id="capo-mas" class="boton-chico" title="Subir un traste">+</button>
         </div>
         <button id="capo-sugerir" class="boton-chico" title="Buscar el traste que deja los acordes más fáciles">Sugerir traste</button>
+      </div>
+    </div>
+
+    <div class="grupo">
+      <div class="grupo-titulo">Importar y exportar</div>
+      <div class="grupo-cuerpo">
+        <button id="importar-midi" class="boton-chico" title="Importar acordes desde un MIDI (ej. el que exporta Chordify)">Importar MIDI…</button>
+        <input id="archivo-midi" type="file" accept=".mid,.midi" style="display:none">
+        <!-- v114: hoja de acordes por compás para imprimir / guardar como PDF -->
+        <button id="hoja-imprimir" class="boton-chico" title="Abre la hoja de acordes por compás, lista para imprimir o guardar como PDF (usa lo último guardado)">Hoja para imprimir</button>
+        <!-- Antes vivía en la barra de transporte: es una acción de escritorio
+             (mezclar un mp3 para subirlo a Chordify), no algo que se toque
+             con la guitarra encima. -->
+        <button id="exportar" class="boton-chico" title="Mezcla las pistas que no están en mute en un solo mp3 (para subir a Chordify, por ejemplo)">Exportar mp3</button>
+      </div>
+    </div>
+
+    <div class="grupo grupo-ancho">
+      <div class="grupo-titulo">Avanzado</div>
+      <div class="grupo-cuerpo">
+        <div class="grupo-fila">
+          <!-- v103: cuánto coincide el detector de Mesa con el MIDI importado -->
+          <button id="comparar-detector" class="boton-chico" title="Vuelve a correr el detector de Mesa y mide cuánto coincide con los acordes del MIDI importado (no cambia los acordes)">Comparar con detector</button>
+          <!-- abre el Bloc de notas EN LA PC: desde la tablet no tiene sentido -->
+          <button id="editar-acordes" class="boton-chico" title="Abrir acordes.txt con el Bloc de notas (en la PC)"{{ '' if es_la_pc else ' style="display:none;"' }}>Abrir .txt</button>
+          <button id="recargar-acordes" class="boton-chico" title="Releer acordes.txt sin recargar la página">Recargar</button>
+        </div>
+        <span id="coincidencia-midi" class="grupo-valor" style="font-size:13px; display:none;"></span>
+        <div class="grupo-fila">
+          <button id="deshacer-acordes" type="button" class="boton-chico" style="display:none;" title="Volver los acordes a como estaban antes de la última vez que se regeneraron, se importó un MIDI o se corrigió el tempo">Deshacer último cambio</button>
+          <button id="regenerar-acordes" class="boton-chico peligro" title="Volver a detectar los acordes desde cero (se puede deshacer)">Regenerar acordes</button>
+        </div>
       </div>
     </div>
 
@@ -11467,6 +11582,7 @@ async function cargarAcordes(){
     else { adv.style.display = "none"; }
     pintarCoincidencia(datos.coincidencia);   // v103: última comparación guardada, si hay
     pintarAvisoTempo(datos.bpm_alternativo);  // v115
+    document.getElementById("deshacer-acordes").style.display = datos.hay_respaldo ? "" : "none";
 
     // recalcular la tonalidad y refrescar la línea de progresión + los grados
     detectarTonalidad();
@@ -12100,6 +12216,62 @@ document.getElementById("capo-sugerir").addEventListener("click", async (e) => {
   }
 });
 
+document.getElementById("deshacer-acordes").addEventListener("click", () => deshacerAcordes());
+
+// --- v115: tap para la sincronía y el tempo ---
+// Sincronía: con el tema sonando, cada toque se compara con el tiempo de la grilla más
+// cercano. A los 4 toques se aplica la mediana de las diferencias (descontando la
+// latencia de salida del audio: el toque va con lo que se OYE, no con lo que se manda).
+let tapsSincronia = [], tapsSincroniaUltimo = 0;
+async function tapSincronia(){
+  if(!sonando){ mesaAviso("Dale play y tocá al ritmo, en cada tiempo."); return; }
+  if(!beatTimes.length){ mesaAviso("Este tema no tiene grilla de compases para sincronizar.", { error: true }); return; }
+  const ahora = performance.now();
+  if(ahora - tapsSincroniaUltimo > 3000) tapsSincronia = [];
+  tapsSincroniaUltimo = ahora;
+  const latencia = (ctx.outputLatency || 0) + (ctx.baseLatency || 0);
+  const pos = posicionActual() - latencia;
+  let mejor = null;
+  for(const t of beatTimes){
+    const d = pos - t;
+    if(mejor === null || Math.abs(d) < Math.abs(mejor)) mejor = d;
+    if(t > pos + 2) break;
+  }
+  tapsSincronia.push(mejor);
+  const btn = document.getElementById("tap-sincronia");
+  const faltan = 4 - tapsSincronia.length;
+  if(faltan > 0){ btn.textContent = `seguí… (${faltan})`; return; }
+  const orden = tapsSincronia.slice().sort((a, b) => a - b);
+  const mediana = (orden[1] + orden[2]) / 2;
+  const disperso = orden[3] - orden[0] > 0.25;
+  tapsSincronia = [];
+  btn.textContent = "Tocá al ritmo";
+  if(disperso){ mesaAviso("Los toques quedaron muy desparejos: probá de nuevo, siguiendo cada tiempo.", { error: true }); return; }
+  if(Math.abs(mediana) < 0.02){ mesaAviso("La sincronía ya estaba bien (menos de 20 ms)."); return; }
+  const delta = -mediana;
+  if(await postConAviso(`/desfasar_acordes/{{ song }}`, { delta })){
+    await cargarAcordes();
+    mesaAviso(`Sincronía corregida ${delta >= 0 ? "+" : ""}${delta.toFixed(2)} s.`, {
+      accion: { texto: "Deshacer", alHacer: () => nudgeOffset(-delta) } });
+  }
+}
+document.getElementById("tap-sincronia").addEventListener("click", tapSincronia);
+
+// Tap tempo: el BPM sale de la mediana de los intervalos entre toques (los últimos 8).
+let tapsTempo = [];
+document.getElementById("tap-tempo").addEventListener("click", (e) => {
+  const ahora = performance.now();
+  if(tapsTempo.length && ahora - tapsTempo[tapsTempo.length - 1] > 2500) tapsTempo = [];
+  tapsTempo.push(ahora);
+  if(tapsTempo.length > 9) tapsTempo.shift();
+  const btn = e.currentTarget;
+  if(tapsTempo.length < 5){ btn.textContent = `seguí… (${5 - tapsTempo.length})`; return; }
+  const intervalos = tapsTempo.slice(1).map((t, i) => t - tapsTempo[i]).sort((a, b) => a - b);
+  const bpm = 60000 / intervalos[Math.floor(intervalos.length / 2)];
+  document.getElementById("bpm-manual").value = bpm.toFixed(1);
+  btn.textContent = `${bpm.toFixed(1)} BPM · seguí o tocá Ajustar`;
+});
+
 document.getElementById("regenerar-acordes").addEventListener("click", (e) => {
   confirmarEnBoton(e.currentTarget, "¿Seguro? tocá de nuevo para confirmar", () => ejecutarRegenerar(e.currentTarget));
 });
@@ -12705,6 +12877,72 @@ document.addEventListener("keydown", (e) => {
   if(t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
   e.preventDefault();
   document.getElementById("play").click();
+});
+
+// v115: más atajos. Las pedaleras Bluetooth "para pasar páginas" mandan flechas o
+// RePág/AvPág: con esto mueven de compás sin tocar la pantalla. No se disparan
+// escribiendo en un campo, con el cajón de ajustes abierto ni con Ctrl/Alt/Cmd.
+const ATAJOS = [
+  ["Espacio", "reproducir / pausa"],
+  ["← →", "compás anterior / siguiente"],
+  ["RePág AvPág · ↑ ↓", "lo mismo (pedaleras Bluetooth)"],
+  ["Inicio", "volver al principio (o al inicio del loop)"],
+  ["M", "mute de la guitarra"],
+  ["G", "guitarra en modo guía (bajita)"],
+  ["L", "loop de este compás"],
+  ["A · B", "inicio / fin del loop"],
+  ["X", "sacar el loop"],
+  ["S", "tocá al ritmo para sincronizar (4 toques)"],
+  ["P", "mostrar u ocultar los próximos compases"],
+  ["E", "abrir o cerrar el editor de acordes"],
+  ["?", "esta ayuda"],
+];
+function mostrarAyudaAtajos(si){
+  let el = document.getElementById("ayuda-atajos");
+  if(!el){
+    el = document.createElement("div");
+    el.id = "ayuda-atajos";
+    el.setAttribute("role", "dialog");
+    el.setAttribute("aria-label", "Atajos de teclado");
+    const filas = ATAJOS.map(([k, d]) => `<dt>${k}</dt><dd>${d}</dd>`).join("");
+    el.innerHTML = `<div class="ayuda-caja"><div class="ayuda-cab"><b>Atajos de teclado</b>`
+      + `<button type="button" class="boton-chico boton-icono" aria-label="Cerrar">&times;</button></div>`
+      + `<dl>${filas}</dl><p class="grupo-nota">Las pedaleras Bluetooth para pasar páginas (las que mandan flechas o RePág/AvPág) cambian de compás sin tocar la pantalla. En la tablet, mantené apretado cualquier botón para ver qué hace.</p></div>`;
+    el.addEventListener("click", (ev) => { if(ev.target === el || ev.target.closest("button")) mostrarAyudaAtajos(false); });
+    document.body.appendChild(el);
+  }
+  el.classList.toggle("visible", !!si);
+}
+document.getElementById("abrir-atajos").addEventListener("click", () => mostrarAyudaAtajos(true));
+document.addEventListener("keydown", (e) => {
+  if(e.ctrlKey || e.metaKey || e.altKey || e.code === "Space") return;
+  const ayuda = document.getElementById("ayuda-atajos");
+  if(ayuda && ayuda.classList.contains("visible")){
+    if(e.key === "Escape" || e.key === "?"){ e.preventDefault(); mostrarAyudaAtajos(false); }
+    return;
+  }
+  if(document.body.classList.contains("cajon-abierto")) return;
+  const t = e.target;
+  if(t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  const clic = id => { const b = document.getElementById(id); if(b && !b.disabled) b.click(); };
+  const clicSel = sel => { const b = document.querySelector(sel); if(b && !b.disabled) b.click(); };
+  switch(e.key){
+    case "ArrowLeft": case "ArrowUp": case "PageUp": clic("compas-ant"); break;
+    case "ArrowRight": case "ArrowDown": case "PageDown": clic("compas-sig"); break;
+    case "Home": clic("rebobinar"); break;
+    case "m": case "M": clicSel('.rapido[data-stem="guitar"]'); break;
+    case "g": case "G": clicSel('.canal[data-id="guitar"] .guia'); break;
+    case "l": case "L": clic("loop-compas"); break;
+    case "a": case "A": clic("loop-a"); break;
+    case "b": case "B": clic("loop-b"); break;
+    case "x": case "X": clic("loop-limpiar"); break;
+    case "s": case "S": tapSincronia(); break;
+    case "p": case "P": alternarProximos(); break;
+    case "e": case "E": clic("abrir-editor"); break;
+    case "?": mostrarAyudaAtajos(true); break;
+    default: return;
+  }
+  e.preventDefault();
 });
 
 // Guarda vol/mute de todas las pistas en el servidor, con debounce para no
