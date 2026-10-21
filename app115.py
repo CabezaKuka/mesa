@@ -306,6 +306,62 @@ def bpm_cancion(song: str):
         return None
 
 
+# v115: un compás es "dudoso" si en algún tiempo con acorde el detector estuvo por debajo
+# de esta confianza (el mismo valor usa el editor para marcarlos)
+UMBRAL_DUDOSO = 0.6
+
+
+def tonalidad_de_acordes(segmentos):
+    """Tonalidad estimada a partir de los acordes ya guardados (no del audio): cada acorde
+    suma sus notas por lo que dura. Devuelve ("Am", "A menor") o (None, None)."""
+    chroma = np.zeros(12)
+    for seg in segmentos:
+        rs = _raiz_y_sufijo(seg.get("acorde"))
+        if not rs:
+            continue
+        dur = max(0.0, float(seg["fin"]) - float(seg["inicio"]))
+        for k, iv in enumerate(SUFIJOS_VALIDOS.get(rs[1], [])):
+            chroma[(rs[0] + iv) % 12] += dur * (1.5 if k == 0 else 1.0)
+    t = estimar_tonalidad(chroma)
+    if not t:
+        return None, None
+    nombre = NOTE_NAMES[t[0]]
+    return (nombre, f"{nombre} mayor") if t[1] == "mayor" else (nombre + "m", f"{nombre} menor")
+
+
+def info_cancion(song: str):
+    """v115: datos chicos para la lista de la portada, sacados de lo que ya está guardado
+    (no dispara ningún análisis): BPM, tonalidad, de dónde salieron los acordes y cuántos
+    compases dudosos quedan por revisar."""
+    info = {"bpm": None, "tonalidad": None, "tonalidad_larga": None, "origen": None, "dudosos": 0}
+    carpeta = stems_dir(song)
+    try:
+        grid = json.loads((carpeta / "acordes_grid.json").read_text(encoding="utf-8"))
+        tokens = _texto_a_tokens((carpeta / "acordes.txt").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return info
+    try:
+        info["bpm"] = int(round(float(grid.get("bpm")))) if grid.get("bpm") else None
+    except (TypeError, ValueError):
+        pass
+    info["origen"] = "midi" if grid.get("origen") == "midi" else "detector"
+    base = grid.get("beat_times") or []
+    try:
+        segmentos = _tokens_a_segmentos(tokens, base, grid.get("duracion", 0))
+        info["tonalidad"], info["tonalidad_larga"] = tonalidad_de_acordes(segmentos)
+    except Exception:  # noqa: BLE001
+        pass
+    conf = _leer_confianza(carpeta, base, grid)
+    if conf:
+        bpc = grid.get("beats_por_compas", 4) or 4
+        c = conf["confianza"]
+        for i in range(0, min(len(c), len(tokens)), bpc):
+            valores = [c[j] for j in range(i, min(i + bpc, len(c), len(tokens))) if tokens[j] != "—"]
+            if valores and min(valores) < UMBRAL_DUDOSO:
+                info["dudosos"] += 1
+    return info
+
+
 def _recientes_path():
     return OUTPUT_DIR / MODEL / "_recientes.json"
 
@@ -3320,6 +3376,7 @@ def home():
         jobs=jobs_activos(), version_app=VERSION_APP,
         iniciales={c: iniciales_cancion(datos[c]["titulo"]) for c in canciones},
         bpms={c: bpm_cancion(c) for c in canciones},
+        info={c: info_cancion(c) for c in canciones},
         en_mesa=False, **contexto_ajustes_generales(),
     )
 
@@ -8457,7 +8514,13 @@ HOME_HTML = BASE_STYLE + """
       <path d="M5 21 H21" stroke="var(--brass)" stroke-width="2" stroke-linecap="round"/>
     </svg>
     <span class="fila-carga-label">Subir un mp3</span>
-    <input type="file" name="mp3" accept="audio/mpeg,audio/mp3,.mp3" required>
+    <!-- v115: el selector nativo salía en el idioma del navegador ("Choose File / No file
+         chosen") y desentonaba; el input sigue ahí (invisible) para el formulario -->
+    <label class="elegir-archivo">
+      <input type="file" name="mp3" id="archivo-mp3" accept="audio/mpeg,audio/mp3,.mp3" required>
+      <span class="boton-chico elegir-archivo-boton">Elegir archivo</span>
+      <span class="elegir-archivo-nombre" id="archivo-mp3-nombre">o arrastralo a la ventana</span>
+    </label>
     <button type="submit" class="boton-primario">Separar pistas</button>
   </form>
 
@@ -8494,10 +8557,14 @@ HOME_HTML = BASE_STYLE + """
         {{ sl.nombre }} <span class="cant">{{ sl.canciones|length }}</span>
       </a>
     {% endfor %}
-    <form class="setlist-crear" action="{{ url_for('crear_setlist') }}" method="post">
+    <!-- v115: el campo ocupaba lo más visible de la portada aunque se usa poco: queda
+         detrás de un botón que lo despliega -->
+    <button type="button" id="nuevo-setlist" class="setlist-chip setlist-nuevo" aria-controls="form-setlist" aria-expanded="false">+ Nuevo setlist</button>
+    <form class="setlist-crear" id="form-setlist" action="{{ url_for('crear_setlist') }}" method="post" hidden>
       <input type="text" name="nombre" placeholder="Nombre del setlist" maxlength="80" required>
       <button type="submit">Crear</button>
     </form>
+    {% if not setlists %}<span class="setlists-vacio">Agrupá temas para un ensayo o un show: pasan solos de uno al siguiente.</span>{% endif %}
   </div>
 </div>
 
@@ -8537,7 +8604,13 @@ HOME_HTML = BASE_STYLE + """
           <a class="cancion" href="{{ url_for('mesa', song=c) }}" data-ini="{{ iniciales[c] }}">
             <span class="cancion-nombre" title="{{ datos[c].titulo }}">{{ datos[c].titulo }}</span>
             <span class="cancion-autor{{ ' sin-autor' if datos[c].autor == '----------' else '' }}" title="{{ datos[c].autor }}">{{ datos[c].autor }}</span>
-            {% if bpms[c] %}<span class="cancion-bpm">{{ bpms[c] }}</span>{% endif %}
+            {% set i = info[c] %}
+            <span class="cancion-datos">
+              {% if i.tonalidad %}<span class="dato-tono" title="Tonalidad estimada por los acordes: {{ i.tonalidad_larga }}">{{ i.tonalidad }}</span>{% endif %}
+              {% if i.bpm %}<span class="dato-bpm">{{ i.bpm }}<small> BPM</small></span>{% endif %}
+              {% if i.origen == 'midi' %}<span class="dato-origen midi" title="Acordes importados de un MIDI">MIDI</span>
+              {% elif i.dudosos %}<span class="dato-origen dudoso" title="{{ i.dudosos }} compases donde el detector dudó: revisalos en el editor">{{ i.dudosos }}?</span>{% endif %}
+            </span>
           </a>
           <div class="cancion-acciones">
             <button class="renombrar-cancion" data-song="{{ c }}" data-titulo="{{ datos[c].titulo if datos[c].titulo != c else '' }}" data-autor="{{ '' if datos[c].autor == '----------' else datos[c].autor }}" title="Cambiar el título/autor que se muestran (no toca el archivo)" aria-label="Renombrar"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="M14 8l3 3"/></svg></button>
@@ -8737,7 +8810,116 @@ HOME_HTML = BASE_STYLE + """
     if(abierta){ var c = p.querySelector(".campo-youtube"); if(c) c.focus(); }
   });
 })();
+
+// v115: selector de archivo propio + arrastrar y soltar un mp3 en cualquier parte de la
+// portada (se sube y se separa directo, como si lo hubieras elegido y tocado "Separar").
+(function(){
+  var input = document.getElementById("archivo-mp3");
+  var nombre = document.getElementById("archivo-mp3-nombre");
+  var panel = document.getElementById("panel-carga");
+  if(!input || !nombre) return;
+  input.addEventListener("change", function(){
+    nombre.textContent = input.files && input.files[0] ? input.files[0].name : "o arrastralo a la ventana";
+    nombre.classList.toggle("elegido", !!(input.files && input.files[0]));
+  });
+  var capa = document.createElement("div");
+  capa.id = "capa-soltar";
+  capa.innerHTML = '<div class="capa-soltar-caja">Soltá el mp3 para separarlo</div>';
+  document.body.appendChild(capa);
+  var profundidad = 0;
+  function esArchivo(e){ return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], "Files") >= 0; }
+  window.addEventListener("dragenter", function(e){ if(!esArchivo(e)) return; profundidad++; capa.classList.add("visible"); });
+  window.addEventListener("dragleave", function(e){ if(!esArchivo(e)) return; if(--profundidad <= 0){ profundidad = 0; capa.classList.remove("visible"); } });
+  window.addEventListener("dragover", function(e){ if(esArchivo(e)) e.preventDefault(); });
+  window.addEventListener("drop", function(e){
+    if(!esArchivo(e)) return;
+    e.preventDefault();
+    profundidad = 0;
+    capa.classList.remove("visible");
+    var archivo = e.dataTransfer.files[0];
+    if(!archivo) return;
+    if(!/\.mp3$/i.test(archivo.name) && archivo.type !== "audio/mpeg"){
+      mesaAviso("Por ahora Mesa separa archivos mp3: «" + archivo.name + "» no lo es.", { error: true });
+      return;
+    }
+    try{
+      var dt = new DataTransfer();
+      dt.items.add(archivo);
+      input.files = dt.files;
+    }catch(err){
+      mesaAviso("Este navegador no deja soltar archivos acá: usá «Elegir archivo».", { error: true });
+      return;
+    }
+    input.dispatchEvent(new Event("change"));
+    if(panel && !panel.classList.contains("abierta")){
+      panel.classList.add("abierta");
+      var b = document.getElementById("toggle-carga");
+      if(b) b.setAttribute("aria-expanded", "true");
+    }
+    input.form.requestSubmit ? input.form.requestSubmit() : input.form.submit();
+  });
+})();
+
+// v115: "+ Nuevo setlist" despliega el campo
+(function(){
+  var b = document.getElementById("nuevo-setlist"), f = document.getElementById("form-setlist");
+  if(!b || !f) return;
+  b.addEventListener("click", function(){
+    f.hidden = !f.hidden;
+    b.setAttribute("aria-expanded", f.hidden ? "false" : "true");
+    if(!f.hidden){ var i = f.querySelector("input"); if(i) i.focus(); }
+  });
+})();
 </script>
+<style>
+  /* v115: selector de archivo propio */
+  .elegir-archivo{ position:relative; display:flex; align-items:center; gap:10px; min-width:120px; flex:1 1 0; cursor:pointer; }
+  .elegir-archivo .elegir-archivo-boton{
+    flex:0 0 auto; padding:8px 14px; border-radius:999px; background:var(--panel-3); color:var(--fg);
+    border:1px solid var(--linea-fuerte); font-weight:600; pointer-events:none;
+  }
+  .fila-carga:has(.elegir-archivo){ flex-wrap:nowrap; }
+  @media (max-width: 600px){
+    /* en el celular no hay qué arrastrar: el nombre solo aparece al elegir, y "Separar" baja */
+    .fila-carga:has(.elegir-archivo){ flex-wrap:wrap; }
+    .elegir-archivo-nombre:not(.elegido){ display:none; }
+    .fila-carga:has(.elegir-archivo) .boton-primario{ flex:0 0 auto; }
+  }
+  .elegir-archivo input[type=file]{ position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+  .elegir-archivo:focus-within .elegir-archivo-boton{ outline:2px solid var(--brass); outline-offset:2px; }
+  .elegir-archivo-nombre{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; color:var(--fg-tenue); }
+  .elegir-archivo-nombre.elegido{ color:var(--fg); font-weight:600; }
+  #capa-soltar{
+    position:fixed; inset:0; z-index:9500; display:none; align-items:center; justify-content:center;
+    background:color-mix(in srgb, var(--bg) 70%, transparent); pointer-events:none;
+  }
+  #capa-soltar.visible{ display:flex; }
+  .capa-soltar-caja{
+    padding:28px 40px; border:2px dashed var(--brass); border-radius:24px; background:var(--panel);
+    font-size:18px; font-weight:700; color:var(--brass);
+  }
+  /* v115: setlists */
+  .setlist-crear[hidden]{ display:none !important; }
+  .setlist-nuevo{ cursor:pointer; border-style:dashed; font:inherit; }
+  .setlists-vacio{ font-size:13px; color:var(--fg-tenue); align-self:center; }
+  /* v115: datos de cada tema en la lista */
+  #grid-todas .cancion-datos{
+    grid-area:bpm; display:flex; align-items:center; gap:10px; margin-right:30px;
+    font:700 12.5px var(--mono); color:var(--fg-tenue); white-space:nowrap;
+  }
+  #grid-todas .dato-bpm small{ font-weight:500; font-size:10.5px; }
+  #grid-todas .dato-tono{ color:var(--fg-dim); min-width:2.2em; text-align:right; }
+  #grid-todas .dato-origen{ padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; }
+  #grid-todas .dato-origen.midi{ background:color-mix(in srgb, var(--ok) 18%, transparent); color:var(--ok); }
+  #grid-todas .dato-origen.dudoso{ background:color-mix(in srgb, var(--brass) 18%, transparent); color:var(--brass); }
+  /* sin autor: el título se centra solo, en vez de un "sin autor" en cada fila */
+  #grid-todas .cancion-autor.sin-autor{ display:none; }
+  #grid-todas a.cancion:has(.sin-autor){ grid-template-areas:"ini nom bpm"; }
+  @media (max-width: 600px){
+    #grid-todas .dato-tono{ display:none; }
+    #grid-todas .cancion-datos{ gap:6px; margin-right:4px; }
+  }
+</style>
 <script>
 // --- descargar / actualizar toda la biblioteca -----------------------------
 // Un toque baja lo que falta y pone al día lo que ya estaba. La distinción la
