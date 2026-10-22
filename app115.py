@@ -1149,7 +1149,12 @@ def run_demucs(job_id: str, input_path: Path):
             job["etapa"] = "cargando"
             job["progreso"] = 0.0
             job.pop("estimado", None)
-            entorno = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+            # v115: TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: desde PyTorch 2.6, torch.load solo acepta
+            # pesos "puros" y los modelos de Demucs traen la clase del modelo adentro. Son los
+            # archivos oficiales de Demucs, así que se deja cargarlos como siempre (con un
+            # PyTorch anterior la variable no hace nada).
+            entorno = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
+                           TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1")
             proc = subprocess.Popen(
                 [sys.executable, "-m", "demucs", "-n", MODEL, "-o", str(OUTPUT_DIR), str(input_path)],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=entorno,

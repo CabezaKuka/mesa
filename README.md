@@ -64,8 +64,10 @@ Corre en tu PC, sin servidores externos ni suscripciones. Se puede usar desde la
 
 ### Dependencias de Python
 
+Si no usás el instalador, a mano (PyTorch conviene instalarlo antes, de [pytorch.org](https://pytorch.org/get-started/locally/), con la versión para tu placa):
+
 ```bash
-pip install flask numpy demucs "yt-dlp[default]" mido pywebview
+pip install -r requisitos.txt
 ```
 
 Opcionales:
@@ -77,6 +79,18 @@ Opcionales:
 | `cryptography` | Avisar cuando el certificado HTTPS está por vencer |
 
 Para descargar de YouTube conviene instalar también **Deno** (`winget install DenoLand.Deno`): sin un motor de JavaScript, YouTube entrega menos formatos y algunas descargas fallan.
+
+---
+
+## Instalar en otra PC (la forma fácil)
+
+1. Copiá la carpeta de Mesa a la otra PC (o bajá el zip del repositorio y descomprimilo). Tiene que tener `app115.py`, la carpeta `templates`, `mesa.ico` y los archivos `instalar_mesa.*`, `abrir_mesa.bat` y `requisitos.txt`.
+2. Doble clic en **`instalar_mesa.bat`**. Si Windows avisa «Windows protegió tu PC», tocá *Más información → Ejecutar de todos modos*.
+3. Esperá a que termine (la primera vez baja unos 3 GB: Python, PyTorch y el modelo de Demucs). Queda un acceso directo **Mesa** en el escritorio.
+
+No hace falta tener Python instalado: el instalador usa [uv](https://docs.astral.sh/uv/), que trae su propio Python y deja todo dentro de la carpeta de Mesa (en `.venv`), sin tocar el resto de la PC. Si hay una placa NVIDIA, instala PyTorch con soporte de la placa; si no, usa el procesador. ffmpeg y Deno se instalan con `winget`. Si algo falla (por ejemplo, se cortó internet), se vuelve a correr y sigue desde donde quedó.
+
+`abrir_mesa.bat` abre siempre el `appNNN.py` de número más alto: para actualizar, alcanza con copiar el nuevo (y su carpeta `templates`) al lado. La biblioteca (`separated/`, `uploads/`) es de cada PC; para llevarte tus temas, copiá también esas carpetas.
 
 ---
 

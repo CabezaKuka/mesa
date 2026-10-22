@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# cmd y PowerShell de Windows: siempre con fin de línea CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf

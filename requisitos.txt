@@ -1,0 +1,13 @@
+# Librerías de Mesa (PyTorch se instala aparte, de su propio servidor, según la placa de video).
+# Las usa instalar_mesa.ps1; a mano: pip install -r requisitos.txt
+flask>=3.0
+numpy>=1.26
+demucs==4.0.1
+soundfile>=0.12
+yt-dlp[default]
+mido>=1.3
+pywebview>=5.0
+# opcionales: pedalera USB, gafas HUD por Bluetooth desde la PC, aviso de certificado por vencer
+pyserial>=3.5
+bleak>=0.22
+cryptography>=42
